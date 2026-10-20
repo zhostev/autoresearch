@@ -84,5 +84,84 @@ class TestClaim(unittest.TestCase):
         self.assertEqual(judge.count_n([{"decision": "基线", "mechanism": "基线"}]), 0)
 
 
+class TestParents(unittest.TestCase):
+    def _row(self, commit, mechanism, val_bpb, simpler="no"):
+        return {
+            "commit": commit,
+            "mechanism": mechanism,
+            "val_bpb": val_bpb,
+            "simpler": simpler,
+        }
+
+    def test_drops_worse_duplicate_mechanism(self):
+        parents = [
+            self._row("a", "学习率", "0.500000"),
+            self._row("b", "学习率", "0.900000"),
+            self._row("c", "深度", "0.400000"),
+        ]
+        newcomer = self._row("d", "窗口", "0.600000")
+        kept, decision, detail = judge.apply_accept(parents, newcomer, None)
+        self.assertEqual(decision, "进入名单")
+        self.assertEqual(detail, "b")
+        self.assertEqual([row["commit"] for row in kept], ["a", "c", "d"])
+
+    def test_drops_worst_when_mechanisms_differ(self):
+        parents = [
+            self._row("a", "学习率", "0.900000"),
+            self._row("b", "深度", "0.800000"),
+            self._row("c", "窗口", "0.700000"),
+        ]
+        newcomer = self._row("d", "优化器", "0.600000")
+        kept, decision, detail = judge.apply_accept(parents, newcomer, None)
+        self.assertEqual(decision, "进入名单")
+        self.assertEqual(detail, "a")
+        self.assertEqual({row["commit"] for row in kept}, {"b", "c", "d"})
+
+    def test_rejects_newcomer_when_it_is_the_one_to_drop(self):
+        parents = [
+            self._row("a", "学习率", "0.900000"),
+            self._row("b", "深度", "0.800000"),
+            self._row("c", "窗口", "0.700000"),
+        ]
+        newcomer = self._row("d", "优化器", "1.100000")
+        kept, decision, detail = judge.apply_accept(parents, newcomer, None)
+        self.assertEqual(decision, "未留下")
+        self.assertEqual(detail, "名单已满")
+        self.assertEqual(kept, parents)
+
+    def test_tie_keeps_the_newcomer(self):
+        parents = [
+            self._row("aaaa", "学习率", "1.000000"),
+            self._row("bbbb", "学习率", "1.000000"),
+            self._row("cccc", "深度", "0.500000"),
+        ]
+        newcomer = self._row("dddd", "窗口", "0.900000")
+        kept, decision, detail = judge.apply_accept(parents, newcomer, None)
+        self.assertEqual(detail, "bbbb")
+        self.assertIn("dddd", [row["commit"] for row in kept])
+        self.assertNotIn("bbbb", [row["commit"] for row in kept])
+
+    def test_simpler_replaces_named_parent(self):
+        parents = [self._row("a", "学习率", "1.000000")]
+        newcomer = self._row("b", "学习率", "1.000000", simpler="yes")
+        kept, decision, detail = judge.apply_accept(parents, newcomer, "a")
+        self.assertEqual(decision, "替换父本")
+        self.assertEqual(detail, "a")
+        self.assertEqual(kept, [newcomer])
+
+    def test_missing_replace_target_raises(self):
+        parents = [self._row("a", "学习率", "1.000000")]
+        newcomer = self._row("b", "深度", "1.000000", simpler="yes")
+        with self.assertRaisesRegex(ValueError, "父本不在名单"):
+            judge.apply_accept(parents, newcomer, "missing")
+
+    def test_already_listed_does_not_duplicate(self):
+        parents = [self._row("a", "学习率", "1.000000")]
+        kept, decision, detail = judge.apply_accept(parents, parents[0], None)
+        self.assertEqual(decision, "未留下")
+        self.assertEqual(detail, "已在名单")
+        self.assertEqual(kept, parents)
+
+
 if __name__ == "__main__":
     unittest.main()

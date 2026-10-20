@@ -84,3 +84,42 @@ def claim_verdict(
     if average > min_improvement and average - penalty > min_improvement:
         return "成立", ""
     return "没有更好", ""
+
+
+def _drop_one(rows: list[dict], newcomer_commit: str) -> dict:
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["mechanism"]] = counts.get(row["mechanism"], 0) + 1
+    duplicated = [row for row in rows if counts[row["mechanism"]] > 1]
+    pool = duplicated if duplicated else list(rows)
+    worst = max(float(row["val_bpb"]) for row in pool)
+    tied = [row for row in pool if float(row["val_bpb"]) == worst]
+    if len(tied) == 1:
+        return tied[0]
+    others = [row for row in tied if row["commit"] != newcomer_commit]
+    if not others:
+        return tied[0]
+    others.sort(key=lambda row: row["commit"])
+    return others[-1]
+
+
+def apply_accept(
+    parents: list[dict], newcomer: dict, replace_commit: str | None
+) -> tuple[list[dict], str, str]:
+    if replace_commit is not None:
+        if not any(row["commit"] == replace_commit for row in parents):
+            raise ValueError("父本不在名单")
+        replaced = [
+            newcomer if row["commit"] == replace_commit else row for row in parents
+        ]
+        return replaced, "替换父本", replace_commit
+    if any(row["commit"] == newcomer["commit"] for row in parents):
+        return list(parents), "未留下", "已在名单"
+    proposed = list(parents) + [newcomer]
+    if len(proposed) <= 3:
+        return proposed, "进入名单", ""
+    victim = _drop_one(proposed, newcomer["commit"])
+    if victim["commit"] == newcomer["commit"]:
+        return list(parents), "未留下", "名单已满"
+    kept = [row for row in proposed if row["commit"] != victim["commit"]]
+    return kept, "进入名单", victim["commit"]
