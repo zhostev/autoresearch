@@ -277,7 +277,7 @@ def blank_row() -> dict:
 def validate_text(seed: str, mechanism: str, expect: str, fail: str) -> str | None:
     if seed not in {"1", "2"}:
         return "种子只允许 1 或 2"
-    if mechanism == "" or mechanism == "基线" or "\t" in mechanism or "\n" in mechanism:
+    if mechanism == "" or (mechanism == "基线" and seed != "2") or "\t" in mechanism or "\n" in mechanism:
         return "机制名无效"
     if expect not in {"lower", "higher"}:
         return "expect 只允许 lower 或 higher"

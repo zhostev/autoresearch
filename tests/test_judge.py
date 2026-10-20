@@ -336,6 +336,48 @@ class TestTrial(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(len(judge.read_results(self.root / "results.tsv")), before)
 
+    def test_seed1_baseline_mechanism_writes_nothing(self):
+        import sys
+
+        self._prepare_child()
+        before = (self.root / "results.tsv").read_text(encoding="utf-8")
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "基线", "--expect", "lower", "--fail", "崩了"],
+            [sys.executable, "-c", "print('seed: 1'); print('val_bpb:          0.900000')"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual((self.root / "results.tsv").read_text(encoding="utf-8"), before)
+
+    def test_seed2_baseline_mechanism_records_score(self):
+        import sys
+
+        judge.append_result(
+            self.root / "results.tsv",
+            self._done_row("基线", "1", "基线", "1.000000"),
+        )
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "基线", "--expect", "lower", "--fail", "崩了"],
+            [sys.executable, "-c", "print('seed: 2'); print('val_bpb:          0.990000')"],
+        )
+        self.assertEqual(code, 0)
+        row = judge.read_results(self.root / "results.tsv")[-1]
+        self.assertEqual(row["decision"], "已记录")
+        self.assertEqual(row["val_bpb"], "0.990000")
+        self.assertEqual(row["mechanism"], "基线")
+        self.assertEqual(row["seed"], "2")
+
+    def test_seed2_baseline_name_on_other_mechanism_writes_nothing(self):
+        import sys
+
+        judge.append_result(self.root / "results.tsv", self._done_row("学习率", "1"))
+        before = len(judge.read_results(self.root / "results.tsv"))
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "基线", "--expect", "lower", "--fail", "崩了"],
+            [sys.executable, "-c", "print('seed: 2'); print('val_bpb:          0.990000')"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), before)
+
     def test_bad_seed_writes_nothing(self):
         code = self._trial(
             ["--seed", "3", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
