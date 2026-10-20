@@ -20,94 +20,72 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You do not launch `train.py` yourself. `judge.py` launches it and records the score.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Choose which parent commit to start from, then commit your edit.
+- Run `judge.py` commands listed below.
+- `git reset` a commit you decided not to keep.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
+- Modify `prepare.py` or `judge.py`.
+- Edit `results.tsv` or `parents.tsv` by hand.
+- Install new packages or add dependencies.
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Hardcode a random seed. `train.py` must keep the `seed_everything()` call.
+- Treat a parent-list update as a validated claim. Do not call a parent-list update a validated claim.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the lowest val_bpb.** The time budget stays 5 minutes. VRAM is a soft constraint. Some increase is acceptable for a meaningful gain, but it should not blow up dramatically.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
-
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
-
-## Output format
-
-Once the script finishes it prints a summary like this:
-
-```
----
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
-```
-
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
-
-```
-grep "^val_bpb:" run.log
-```
-
-## Logging results
-
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
-```
-
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
+**Simplicity:** You judge whether added code is worth the gain. `judge.py` does not measure simplicity. A strictly lower seed-1 `val_bpb` may enter the parent list only if you then run `accept`. An equal seed-1 score can replace a listed parent only through `accept --simpler`. A higher seed-1 score never enters the list.
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+Work on a branch such as `autoresearch/mar5`. The first command on a clean baseline commit is:
+
+```text
+uv run judge.py baseline
+```
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Read `parents.tsv` and `results.tsv`. Do not always continue from the most recently accepted parent.
+2. Check out the chosen parent commit.
+3. Write down the mechanism in three facts: a short mechanism name, whether you expect `val_bpb` to go `lower` or `higher`, and one sentence for what counts as failure. The same short name is the same mechanism even if the other two sentences change.
+4. Edit `train.py` and git commit. The new commit's parent must be the chosen parent.
+5. Run:
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+```text
+uv run judge.py trial --seed 1 --mechanism 学习率 --expect lower --fail 变高或崩溃
+```
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+6. Read the new `results.tsv` row. `judge.py` does not create commits and does not reset them.
+7. If the decision is `好于父本` and the complexity is worth keeping, leave the commit and run `uv run judge.py accept`.
+8. If the decision is `持平` and the code is simpler, leave the commit and run `uv run judge.py accept --simpler --replace <parent-hash>`.
+9. If the decision is `差于父本`, or the complexity is not worth it, `git reset` back to the parent. Do not run `accept`.
+10. If the decision is `代码坏了`, fix a typo or missing import and try again. If the idea itself cannot run, leave the crash row and move on. Do not describe that crash as the mechanism being worse.
+11. If the decision is `测量失败`, do not accept the commit. Reset and fix the seed printing before counting the idea.
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+Overnight search uses seed 1 only. The parent list holds at most three commits.
+
+## Morning claim
+
+Pick one or two commits you might call validated. For the parent and then the candidate, check out that commit with a clean tree and run:
+
+```text
+uv run judge.py trial --seed 2 --mechanism <same short name> --expect lower --fail <same failure sentence>
+```
+
+Then, on the candidate commit, run:
+
+```text
+uv run judge.py claim
+```
+
+Only a `claim` row whose decision is `成立` is a validated result. `还判不了` means the materials were insufficient. `进入名单` is not that result.
+
+`judge.py` kills a training run that exceeds 10 minutes and records `代码坏了`.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 

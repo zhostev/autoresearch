@@ -555,3 +555,18 @@ class TestSeedWiring(unittest.TestCase):
         prepare_source = Path("prepare.py").read_text(encoding="utf-8")
         self.assertIn("TIME_BUDGET = 300", prepare_source)
         self.assertIn("def evaluate_bpb(", prepare_source)
+
+
+class TestInstructions(unittest.TestCase):
+    def test_program_describes_the_split(self):
+        text = Path("program.md").read_text(encoding="utf-8")
+        self.assertIn("uv run judge.py trial --seed 1", text)
+        self.assertIn("uv run judge.py accept", text)
+        self.assertIn("uv run judge.py claim", text)
+        self.assertIn("judge.py", text)
+        self.assertIn("parents.tsv", text)
+        self.assertIn("Do not call a parent-list update a validated claim.", text)
+        ignored = Path(".gitignore").read_text(encoding="utf-8")
+        self.assertIn("results.tsv", ignored)
+        self.assertIn("parents.tsv", ignored)
+        self.assertIn("run.log", ignored)
