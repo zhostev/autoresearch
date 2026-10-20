@@ -215,3 +215,37 @@ class TestTsv(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestParse(unittest.TestCase):
+    def test_padded_val_bpb_line(self):
+        text = "seed: 1\n---\nval_bpb:          0.997900\ntraining_seconds: 300.1\n"
+        self.assertEqual(judge.parse_summary(text), ("1", "0.997900"))
+
+    def test_last_occurrence_wins(self):
+        text = "seed: 0\nval_bpb: 1.000000\nseed: 2\nval_bpb:          0.500000\n"
+        self.assertEqual(judge.parse_summary(text), ("2", "0.500000"))
+
+    def test_missing_lines(self):
+        self.assertEqual(judge.parse_summary("no summary\n"), (None, None))
+
+    def test_data_hash_uses_sizes_not_bytes(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token_dir = root / "tokenizer"
+            token_dir.mkdir()
+            tokenizer = token_dir / "tokenizer.pkl"
+            tokenizer.write_bytes(b"abc")
+            data = root / "data"
+            data.mkdir()
+            val = data / "shard_06542.parquet"
+            val.write_bytes(b"12345")
+            (data / "shard_00001.parquet").write_bytes(b"z")
+            first = judge.data_hash(tokenizer, val, data)
+            val.write_bytes(b"1234")
+            second = judge.data_hash(tokenizer, val, data)
+            self.assertIsNotNone(first)
+            self.assertNotEqual(first, second)
+            self.assertIsNone(judge.data_hash(tokenizer, root / "missing.parquet", data))

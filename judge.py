@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import statistics
@@ -198,3 +199,36 @@ def record_accept(
     append_result(results_path, result_row)
     if new_parents is not None:
         write_parents(parents_path, new_parents)
+
+
+def parse_summary(text: str) -> tuple[str | None, str | None]:
+    seed = None
+    val_bpb = None
+    for line in text.splitlines():
+        if line.startswith("seed:"):
+            parts = line.split()
+            seed = parts[1] if len(parts) > 1 else None
+        elif line.startswith("val_bpb:"):
+            parts = line.split()
+            val_bpb = parts[1] if len(parts) > 1 else None
+    return seed, val_bpb
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def data_hash(tokenizer_path: Path, val_path: Path, data_dir: Path) -> str | None:
+    if not tokenizer_path.is_file() or not val_path.is_file() or not data_dir.is_dir():
+        return None
+    lines = [
+        f"tokenizer.pkl {tokenizer_path.stat().st_size}",
+        f"shard_06542.parquet {val_path.stat().st_size}",
+    ]
+    for path in sorted(data_dir.glob("*.parquet")):
+        lines.append(f"{path.name} {path.stat().st_size}")
+    digest = hashlib.sha256()
+    digest.update(("\n".join(lines) + "\n").encode("utf-8"))
+    return digest.hexdigest()
