@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
 import statistics
+from pathlib import Path
 
 MIN_IMPROVEMENT: float | None = None
 TIMEOUT_SECONDS = 600
@@ -123,3 +125,76 @@ def apply_accept(
         return list(parents), "未留下", "名单已满"
     kept = [row for row in proposed if row["commit"] != victim["commit"]]
     return kept, "进入名单", victim["commit"]
+
+
+RESULT_HEADER = (
+    "commit\tparent\tmechanism\texpect\tfail\tseed\tval_bpb\t"
+    "prepare_hash\tdata_hash\tdecision\tdetail"
+)
+PARENT_HEADER = "commit\tmechanism\tval_bpb\tsimpler"
+RESULT_FIELDS = RESULT_HEADER.split("\t")
+PARENT_FIELDS = PARENT_HEADER.split("\t")
+
+
+def _line(fields: list[str], row: dict) -> str:
+    return "\t".join(row[field] for field in fields)
+
+
+def read_results(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = []
+    for line in lines[1:]:
+        if line == "":
+            continue
+        parts = line.split("\t")
+        rows.append(dict(zip(RESULT_FIELDS, parts)))
+    return rows
+
+
+def append_result(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists()
+    with path.open("a", encoding="utf-8") as handle:
+        if new_file:
+            handle.write(RESULT_HEADER + "\n")
+        handle.write(_line(RESULT_FIELDS, row) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def read_parents(path: Path) -> list[dict]:
+    if not path.exists() or path.is_dir():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = []
+    for line in lines[1:]:
+        if line == "":
+            continue
+        parts = line.split("\t")
+        rows.append(dict(zip(PARENT_FIELDS, parts)))
+    return rows
+
+
+def write_parents(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(PARENT_HEADER + "\n")
+        for row in rows:
+            handle.write(_line(PARENT_FIELDS, row) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def record_accept(
+    results_path: Path,
+    parents_path: Path,
+    result_row: dict,
+    new_parents: list[dict] | None,
+) -> None:
+    append_result(results_path, result_row)
+    if new_parents is not None:
+        write_parents(parents_path, new_parents)

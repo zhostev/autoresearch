@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import judge
 
@@ -161,6 +162,55 @@ class TestParents(unittest.TestCase):
         self.assertEqual(decision, "未留下")
         self.assertEqual(detail, "已在名单")
         self.assertEqual(kept, parents)
+
+
+class TestTsv(unittest.TestCase):
+    def test_append_is_stable_and_creates_header(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.tsv"
+            row = {name: name for name in judge.RESULT_HEADER.split("\t")}
+            row["val_bpb"] = ""
+            judge.append_result(path, row)
+            judge.append_result(path, row)
+            rows = judge.read_results(path)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(list(rows[0]), judge.RESULT_HEADER.split("\t"))
+            self.assertEqual(rows[0]["val_bpb"], "")
+            self.assertEqual(path.read_text(encoding="utf-8").splitlines()[0], judge.RESULT_HEADER)
+
+    def test_parent_write_failure_keeps_the_appended_result(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results.tsv"
+            parents = root / "parents.tsv"
+            parents.mkdir()
+            row = {name: "x" for name in judge.RESULT_HEADER.split("\t")}
+            new_parents = [{
+                "commit": "abc",
+                "mechanism": "学习率",
+                "val_bpb": "0.900000",
+                "simpler": "no",
+            }]
+            with self.assertRaises(OSError):
+                judge.record_accept(results, parents, row, new_parents)
+            self.assertEqual(len(judge.read_results(results)), 1)
+            self.assertTrue(parents.is_dir())
+
+    def test_record_accept_can_skip_parent_rewrite(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = root / "results.tsv"
+            parents = root / "parents.tsv"
+            row = {name: "x" for name in judge.RESULT_HEADER.split("\t")}
+            judge.record_accept(results, parents, row, None)
+            self.assertEqual(len(judge.read_results(results)), 1)
+            self.assertFalse(parents.exists())
 
 
 if __name__ == "__main__":
