@@ -23,6 +23,17 @@ import rustbpe
 import tiktoken
 import torch
 
+
+def seed_everything():
+    raw = os.environ.get("AUTORES_SEED")
+    if raw is None or raw.strip() == "":
+        raise SystemExit("AUTORES_SEED is required")
+    seed = int(raw)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    return seed
+
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------

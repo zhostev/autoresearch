@@ -530,3 +530,28 @@ class TestCommands(TestTrial):
             sys.executable, "-c",
             f"print('seed: {seed}'); print('val_bpb:          {bpb}')",
         ]
+
+
+class TestSeedWiring(unittest.TestCase):
+    def test_prepare_requires_the_env_var(self):
+        import os
+        import prepare
+
+        os.environ.pop("AUTORES_SEED", None)
+        with self.assertRaises(SystemExit):
+            prepare.seed_everything()
+
+    def test_prepare_returns_the_env_seed(self):
+        import os
+        import prepare
+
+        os.environ["AUTORES_SEED"] = "2"
+        self.assertEqual(prepare.seed_everything(), 2)
+
+    def test_train_source_no_longer_hardcodes_seed_42(self):
+        source = Path("train.py").read_text(encoding="utf-8")
+        self.assertNotIn("manual_seed(42)", source)
+        self.assertIn("seed_everything()", source)
+        prepare_source = Path("prepare.py").read_text(encoding="utf-8")
+        self.assertIn("TIME_BUDGET = 300", prepare_source)
+        self.assertIn("def evaluate_bpb(", prepare_source)
