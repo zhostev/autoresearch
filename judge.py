@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import math
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -290,12 +291,20 @@ def run_command(command: list[str], seed: str, log_path: Path, timeout: float) -
     env["AUTORES_SEED"] = seed
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.Popen(
-            command, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=log_path.parent
+            command,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=log_path.parent,
+            start_new_session=True,
         )
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             proc.wait()
             return 124
 

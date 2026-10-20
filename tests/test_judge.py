@@ -382,6 +382,58 @@ class TestTrial(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["decision"], "代码坏了")
 
+    def test_timeout_kills_child_sleeper(self):
+        import os
+        import sys
+        import time
+
+        self._prepare_child()
+        pid_path = self.root / "sleeper.pid"
+        script = "\n".join([
+            "import subprocess, sys",
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
+            f"handle = open({str(pid_path)!r}, 'w', encoding='utf-8')",
+            "handle.write(str(child.pid))",
+            "handle.close()",
+            "child.wait()",
+        ])
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            [sys.executable, "-c", script],
+            timeout=1,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["decision"], "代码坏了")
+        self.assertTrue(pid_path.is_file(), "sleeper pid was not recorded")
+        pid = int(pid_path.read_text(encoding="utf-8"))
+        try:
+            deadline = time.monotonic() + 1
+            running = True
+            while time.monotonic() < deadline:
+                if not self._sleeper_running(pid):
+                    running = False
+                    break
+                time.sleep(0.02)
+            self.assertFalse(running, "child sleeper still running after timeout")
+        finally:
+            if self._sleeper_running(pid):
+                os.kill(pid, 9)
+
+    def _sleeper_running(self, pid: int) -> bool:
+        import os
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        stat_path = Path(f"/proc/{pid}/stat")
+        try:
+            stat = stat_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return False
+        state = stat[stat.rfind(")") + 2]
+        return state != "Z"
+
     def test_seed_mismatch_blocks_accept(self):
         import sys
 
