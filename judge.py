@@ -317,17 +317,26 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(prog="judge.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("baseline", "accept", "claim"):
+    for name in ("baseline", "claim"):
         sub.add_parser(name)
+    accept_parser = sub.add_parser("accept")
+    accept_parser.add_argument("--simpler", action="store_true")
+    accept_parser.add_argument("--replace", default=None)
     trial = sub.add_parser("trial")
     trial.add_argument("--seed", required=True)
     trial.add_argument("--mechanism", required=True)
     trial.add_argument("--expect", required=True)
     trial.add_argument("--fail", required=True)
     args = parser.parse_args(argv)
+    repo = root or Path.cwd()
+    if args.cmd == "baseline":
+        return cmd_baseline(repo, command or ["uv", "run", "train.py"], TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds, root is not None)
+    if args.cmd == "accept":
+        return cmd_accept(repo, args.simpler, args.replace)
+    if args.cmd == "claim":
+        return cmd_claim(repo)
     if args.cmd != "trial":
         return 2
-    repo = root or Path.cwd()
     timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     train = command or ["uv", "run", "train.py"]
     error = validate_text(args.seed, args.mechanism, args.expect, args.fail)
@@ -402,6 +411,172 @@ def main(
     parent_bpb = float(parent_rows[-1]["val_bpb"])
     row["decision"] = compare_seed1(float(printed_bpb), parent_bpb)
     append_result(results_path, row)
+    return 0
+
+
+def _latest(rows: list[dict], commit: str, seed: str) -> dict | None:
+    found = [row for row in rows if row["commit"] == commit and row["seed"] == seed]
+    return found[-1] if found else None
+
+
+def _bpb(row: dict | None) -> float | None:
+    if row is None or row["val_bpb"] == "":
+        return None
+    return float(row["val_bpb"])
+
+
+def cmd_baseline(repo: Path, command: list[str], timeout: float, test_root: bool) -> int:
+    if is_dirty(repo):
+        return 2
+    head = git_output(repo, "rev-parse", "HEAD")
+    if head is None:
+        return 2
+    results_path = repo / "results.tsv"
+    rows = read_results(results_path)
+    existing = [
+        row for row in rows
+        if row["commit"] == head and row["seed"] == "1" and row["decision"] == "基线"
+    ]
+    if existing and not read_parents(repo / "parents.tsv"):
+        write_parents(repo / "parents.tsv", [{
+            "commit": head,
+            "mechanism": "基线",
+            "val_bpb": existing[-1]["val_bpb"],
+            "simpler": "no",
+        }])
+        return 0
+    if existing:
+        return 2
+    tokenizer, val, data_dir = trial_paths(repo) if test_root else production_paths()
+    row = blank_row()
+    row.update({
+        "commit": head,
+        "parent": "",
+        "mechanism": "基线",
+        "expect": "lower",
+        "fail": "基线",
+        "seed": "1",
+        "prepare_hash": file_sha256(repo / "prepare.py"),
+    })
+    identity = data_hash(tokenizer, val, data_dir)
+    if identity is None:
+        row["decision"] = "代码坏了"
+        row["detail"] = "数据身份不可用"
+        append_result(results_path, row)
+        return 0
+    row["data_hash"] = identity
+    code = run_command(command, "1", repo / "run.log", timeout)
+    log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
+    printed_seed, printed_bpb = parse_summary(log_text)
+    if code != 0 or printed_bpb is None:
+        row["decision"] = "代码坏了"
+        append_result(results_path, row)
+        return 0
+    if printed_seed != "1":
+        row["decision"] = "测量失败"
+        append_result(results_path, row)
+        return 0
+    row["val_bpb"] = printed_bpb
+    row["decision"] = "基线"
+    append_result(results_path, row)
+    write_parents(repo / "parents.tsv", [{
+        "commit": head,
+        "mechanism": "基线",
+        "val_bpb": printed_bpb,
+        "simpler": "no",
+    }])
+    return 0
+
+
+def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
+    if is_dirty(repo):
+        return 2
+    head = git_output(repo, "rev-parse", "HEAD")
+    if head is None:
+        return 2
+    seed1 = _latest(read_results(repo / "results.tsv"), head, "1")
+    if seed1 is None:
+        return 2
+    if simpler:
+        if seed1["decision"] != "持平" or not replace_commit:
+            return 2
+    elif seed1["decision"] != "好于父本":
+        return 2
+    newcomer = {
+        "commit": head,
+        "mechanism": seed1["mechanism"],
+        "val_bpb": seed1["val_bpb"],
+        "simpler": "yes" if simpler else "no",
+    }
+    try:
+        parents, decision, detail = apply_accept(
+            read_parents(repo / "parents.tsv"),
+            newcomer,
+            replace_commit if simpler else None,
+        )
+    except ValueError:
+        return 2
+    result = blank_row()
+    result.update({
+        "commit": head,
+        "parent": seed1["parent"],
+        "mechanism": seed1["mechanism"],
+        "expect": seed1["expect"],
+        "fail": seed1["fail"],
+        "seed": "*",
+        "prepare_hash": seed1["prepare_hash"],
+        "data_hash": seed1["data_hash"],
+        "decision": decision,
+        "detail": detail,
+    })
+    record_accept(
+        repo / "results.tsv",
+        repo / "parents.tsv",
+        result,
+        None if decision == "未留下" else parents,
+    )
+    return 0
+
+
+def cmd_claim(repo: Path) -> int:
+    if is_dirty(repo):
+        return 2
+    head = git_output(repo, "rev-parse", "HEAD")
+    if head is None:
+        return 2
+    parent = git_output(repo, "rev-parse", "HEAD^")
+    rows = read_results(repo / "results.tsv")
+    result = blank_row()
+    result.update({"commit": head, "parent": parent or "", "seed": "*"})
+    if parent is None:
+        result["decision"] = "还判不了"
+        result["detail"] = "缺父本提交"
+        append_result(repo / "results.tsv", result)
+        return 0
+    slots = [
+        _latest(rows, head, "1"),
+        _latest(rows, head, "2"),
+        _latest(rows, parent, "1"),
+        _latest(rows, parent, "2"),
+    ]
+    seed1 = slots[0]
+    if seed1 is not None:
+        result["mechanism"] = seed1["mechanism"]
+        result["expect"] = seed1["expect"]
+        result["fail"] = seed1["fail"]
+    decision, detail = claim_verdict(
+        _bpb(slots[0]),
+        _bpb(slots[1]),
+        _bpb(slots[2]),
+        _bpb(slots[3]),
+        [row["prepare_hash"] if row else "" for row in slots],
+        [row["data_hash"] if row else "" for row in slots],
+        MIN_IMPROVEMENT,
+        count_n(rows),
+    )
+    result["decision"] = decision
+    result["detail"] = detail
+    append_result(repo / "results.tsv", result)
     return 0
 
 

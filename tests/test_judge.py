@@ -446,3 +446,87 @@ class TestTrial(unittest.TestCase):
         self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["decision"], "测量失败")
         self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["val_bpb"], "")
         self.assertEqual(judge.main(["accept"], root=self.root), 2)
+
+
+class TestCommands(TestTrial):
+    def test_replace_unknown_parent_writes_nothing(self):
+        judge.write_parents(self.root / "parents.tsv", [{
+            "commit": git_head(self.root),
+            "mechanism": "基线",
+            "val_bpb": "1.000000",
+            "simpler": "no",
+        }])
+        before = (self.root / "parents.tsv").read_text(encoding="utf-8")
+        code = judge.main(
+            ["accept", "--simpler", "--replace", "deadbeef"],
+            root=self.root,
+        )
+        self.assertEqual(code, 2)
+        self.assertFalse((self.root / "results.tsv").exists())
+        self.assertEqual((self.root / "parents.tsv").read_text(encoding="utf-8"), before)
+
+    def test_claim_empty_score_names_the_gap(self):
+        head = git_head(self.root)
+        self._git("commit", "--allow-empty", "-m", "child")
+        child = git_head(self.root)
+        for commit, seed, val in (
+            (head, "1", "1.000000"),
+            (head, "2", ""),
+            (child, "1", "0.900000"),
+            (child, "2", "0.900000"),
+        ):
+            row = self._done_row("学习率", seed, "已记录", val)
+            row["commit"] = commit
+            row["parent"] = head if commit == child else ""
+            row["prepare_hash"] = "p"
+            row["data_hash"] = "d"
+            if seed == "1" and commit == head:
+                row["decision"] = "基线"
+            judge.append_result(self.root / "results.tsv", row)
+        code = judge.main(["claim"], root=self.root)
+        self.assertEqual(code, 0)
+        claim = judge.read_results(self.root / "results.tsv")[-1]
+        self.assertEqual(claim["decision"], "还判不了")
+        self.assertEqual(claim["detail"], "缺父本种子2")
+        self.assertEqual(claim["seed"], "*")
+
+    def test_baseline_repair_does_not_train(self):
+        head = git_head(self.root)
+        row = self._done_row("基线", "1", "基线", "1.000000")
+        row["commit"] = head
+        judge.append_result(self.root / "results.tsv", row)
+        code = judge.main(
+            ["baseline"],
+            command=["python", "-c", "raise SystemExit('trained')"],
+            root=self.root,
+        )
+        self.assertEqual(code, 0)
+        parents = judge.read_parents(self.root / "parents.tsv")
+        self.assertEqual(parents[0]["commit"], head)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), 1)
+
+    def test_seed1_better_does_not_change_parents_or_head(self):
+        import sys
+
+        self._prepare_child()
+        child = git_head(self.root)
+        code = judge.main(
+            ["trial", "--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "变高"],
+            command=[
+                sys.executable, "-c",
+                "print('seed: 1'); print('val_bpb:          0.900000')",
+            ],
+            root=self.root,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["decision"], "好于父本")
+        self.assertEqual(len(judge.read_parents(self.root / "parents.tsv")), 1)
+        self.assertEqual(git_head(self.root), child)
+
+    def _ok(self, seed, bpb):
+        import sys
+
+        return [
+            sys.executable, "-c",
+            f"print('seed: {seed}'); print('val_bpb:          {bpb}')",
+        ]
