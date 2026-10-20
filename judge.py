@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import math
 import os
 import statistics
+import subprocess
+import sys
 from pathlib import Path
 
 MIN_IMPROVEMENT: float | None = None
@@ -232,3 +235,166 @@ def data_hash(tokenizer_path: Path, val_path: Path, data_dir: Path) -> str | Non
     digest = hashlib.sha256()
     digest.update(("\n".join(lines) + "\n").encode("utf-8"))
     return digest.hexdigest()
+
+
+def trial_paths(root: Path) -> tuple[Path, Path, Path]:
+    data_dir = root / "data"
+    return root / "tokenizer.pkl", data_dir / "shard_06542.parquet", data_dir
+
+
+def production_paths() -> tuple[Path, Path, Path]:
+    from prepare import DATA_DIR, TOKENIZER_DIR, VAL_FILENAME
+
+    return (
+        Path(TOKENIZER_DIR) / "tokenizer.pkl",
+        Path(DATA_DIR) / VAL_FILENAME,
+        Path(DATA_DIR),
+    )
+
+
+def git_output(root: Path, *args: str) -> str | None:
+    completed = subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, text=True
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def is_dirty(root: Path) -> bool:
+    completed = subprocess.run(
+        ["git", "status", "--porcelain", "--", "train.py", "prepare.py", "judge.py"],
+        cwd=root, capture_output=True, text=True,
+    )
+    return completed.returncode != 0 or completed.stdout.strip() != ""
+
+
+def blank_row() -> dict:
+    return {field: "" for field in RESULT_FIELDS}
+
+
+def validate_text(seed: str, mechanism: str, expect: str, fail: str) -> str | None:
+    if seed not in {"1", "2"}:
+        return "种子只允许 1 或 2"
+    if mechanism == "" or mechanism == "基线" or "\t" in mechanism or "\n" in mechanism:
+        return "机制名无效"
+    if expect not in {"lower", "higher"}:
+        return "expect 只允许 lower 或 higher"
+    if fail == "" or "\t" in fail or "\n" in fail:
+        return "失败说明无效"
+    return None
+
+
+def run_command(command: list[str], seed: str, log_path: Path, timeout: float) -> int:
+    env = os.environ.copy()
+    env["AUTORES_SEED"] = seed
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=log_path.parent
+        )
+        try:
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return 124
+
+
+def main(
+    argv: list[str] | None = None,
+    command: list[str] | None = None,
+    timeout_seconds: float | None = None,
+    root: Path | None = None,
+) -> int:
+    parser = argparse.ArgumentParser(prog="judge.py")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("baseline", "accept", "claim"):
+        sub.add_parser(name)
+    trial = sub.add_parser("trial")
+    trial.add_argument("--seed", required=True)
+    trial.add_argument("--mechanism", required=True)
+    trial.add_argument("--expect", required=True)
+    trial.add_argument("--fail", required=True)
+    args = parser.parse_args(argv)
+    if args.cmd != "trial":
+        return 2
+    repo = root or Path.cwd()
+    timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    train = command or ["uv", "run", "train.py"]
+    error = validate_text(args.seed, args.mechanism, args.expect, args.fail)
+    if error is not None or is_dirty(repo):
+        return 2
+    head = git_output(repo, "rev-parse", "HEAD")
+    if head is None:
+        return 2
+    results_path = repo / "results.tsv"
+    rows = read_results(results_path)
+    if any(row["commit"] == head and row["seed"] == args.seed for row in rows):
+        return 2
+    if args.seed == "2":
+        seed1 = [
+            row for row in rows
+            if row["commit"] == head and row["seed"] == "1"
+            and row["decision"] in {"基线", "好于父本", "持平", "差于父本"}
+        ]
+        if not seed1 or seed1[-1]["mechanism"] != args.mechanism:
+            return 2
+    else:
+        parent = git_output(repo, "rev-parse", "HEAD^")
+        listed = {row["commit"] for row in read_parents(repo / "parents.tsv")}
+        if parent is None or parent not in listed:
+            return 2
+        parent_scores = [
+            item for item in rows
+            if item["commit"] == parent and item["seed"] == "1" and item["val_bpb"] != ""
+        ]
+        if not parent_scores:
+            return 2
+    tokenizer, val, data_dir = trial_paths(repo) if root is not None else production_paths()
+    prepare_hash = file_sha256(repo / "prepare.py")
+    identity = data_hash(tokenizer, val, data_dir)
+    row = blank_row()
+    row.update({
+        "commit": head,
+        "parent": git_output(repo, "rev-parse", "HEAD^") or "",
+        "mechanism": args.mechanism,
+        "expect": args.expect,
+        "fail": args.fail,
+        "seed": args.seed,
+        "prepare_hash": prepare_hash,
+    })
+    if identity is None:
+        row["decision"] = "代码坏了"
+        row["detail"] = "数据身份不可用"
+        append_result(results_path, row)
+        return 0
+    row["data_hash"] = identity
+    code = run_command(train, args.seed, repo / "run.log", timeout)
+    log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
+    printed_seed, printed_bpb = parse_summary(log_text)
+    if code != 0 or printed_bpb is None:
+        row["decision"] = "代码坏了"
+        append_result(results_path, row)
+        return 0
+    if printed_seed != args.seed:
+        row["decision"] = "测量失败"
+        append_result(results_path, row)
+        return 0
+    row["val_bpb"] = printed_bpb
+    if args.seed == "2":
+        row["decision"] = "已记录"
+        append_result(results_path, row)
+        return 0
+    parent_commit = row["parent"]
+    parent_rows = [
+        item for item in rows
+        if item["commit"] == parent_commit and item["seed"] == "1" and item["val_bpb"] != ""
+    ]
+    parent_bpb = float(parent_rows[-1]["val_bpb"])
+    row["decision"] = compare_seed1(float(printed_bpb), parent_bpb)
+    append_result(results_path, row)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

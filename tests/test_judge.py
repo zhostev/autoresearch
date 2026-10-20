@@ -249,3 +249,148 @@ class TestParse(unittest.TestCase):
             self.assertIsNotNone(first)
             self.assertNotEqual(first, second)
             self.assertIsNone(judge.data_hash(tokenizer, root / "missing.parquet", data))
+
+
+def git_head(root: Path) -> str:
+    import subprocess
+
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+
+
+class TestTrial(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._git("init")
+        self._git("config", "user.email", "test@example.com")
+        self._git("config", "user.name", "test")
+        (self.root / "prepare.py").write_text("TIME_BUDGET = 300\n", encoding="utf-8")
+        (self.root / "train.py").write_text("print('train')\n", encoding="utf-8")
+        (self.root / "judge.py").write_text("# test copy\n", encoding="utf-8")
+        data = self.root / "data"
+        data.mkdir()
+        (data / "shard_06542.parquet").write_bytes(b"val")
+        (data / "shard_00001.parquet").write_bytes(b"train")
+        (self.root / "tokenizer.pkl").write_bytes(b"tok")
+        self._git("add", "prepare.py", "train.py", "judge.py")
+        self._git("commit", "-m", "base")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _git(self, *args):
+        import subprocess
+
+        subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True)
+
+    def _trial(self, args, command, timeout=5):
+        return judge.main(
+            ["trial", *args],
+            command=command,
+            timeout_seconds=timeout,
+            root=self.root,
+        )
+
+    def _done_row(self, mechanism, seed, decision="好于父本", val="1.000000"):
+        return {
+            "commit": git_head(self.root),
+            "parent": "",
+            "mechanism": mechanism,
+            "expect": "lower",
+            "fail": "崩了",
+            "seed": seed,
+            "val_bpb": val,
+            "prepare_hash": "p",
+            "data_hash": "d",
+            "decision": decision,
+            "detail": "",
+        }
+
+    def _prepare_child(self):
+        parent = git_head(self.root)
+        judge.write_parents(self.root / "parents.tsv", [{
+            "commit": parent,
+            "mechanism": "基线",
+            "val_bpb": "1.000000",
+            "simpler": "no",
+        }])
+        base = self._done_row("基线", "1", "基线", "1.000000")
+        base["commit"] = parent
+        judge.append_result(self.root / "results.tsv", base)
+        (self.root / "train.py").write_text("print('next')\n", encoding="utf-8")
+        self._git("add", "train.py")
+        self._git("commit", "-m", "try")
+        return parent
+
+    def test_seed2_mechanism_mismatch_writes_nothing(self):
+        judge.append_result(self.root / "results.tsv", self._done_row("学习率", "1"))
+        before = len(judge.read_results(self.root / "results.tsv"))
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "深度", "--expect", "lower", "--fail", "崩了"],
+            ["python", "-c", "print('should-not-run')"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), before)
+
+    def test_bad_seed_writes_nothing(self):
+        code = self._trial(
+            ["--seed", "3", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["python", "-c", "print('no')"],
+        )
+        self.assertEqual(code, 2)
+        self.assertFalse((self.root / "results.tsv").exists())
+
+    def test_tab_in_fail_writes_nothing(self):
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "a\tb"],
+            ["python", "-c", "print('no')"],
+        )
+        self.assertEqual(code, 2)
+        self.assertFalse((self.root / "results.tsv").exists())
+
+    def test_dirty_train_py_writes_nothing(self):
+        (self.root / "train.py").write_text("print('dirty')\n", encoding="utf-8")
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["python", "-c", "print('no')"],
+        )
+        self.assertEqual(code, 2)
+        self.assertFalse((self.root / "results.tsv").exists())
+
+    def test_duplicate_seed_writes_nothing(self):
+        judge.append_result(self.root / "results.tsv", self._done_row("学习率", "1"))
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["python", "-c", "print('no')"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), 1)
+
+    def test_timeout_records_crash(self):
+        import sys
+
+        self._prepare_child()
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout=0.2,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["decision"], "代码坏了")
+
+    def test_seed_mismatch_blocks_accept(self):
+        import sys
+
+        self._prepare_child()
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            [sys.executable, "-c", "print('seed: 9'); print('val_bpb:          0.900000')"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["decision"], "测量失败")
+        self.assertEqual(judge.read_results(self.root / "results.tsv")[-1]["val_bpb"], "")
+        self.assertEqual(judge.main(["accept"], root=self.root), 2)
