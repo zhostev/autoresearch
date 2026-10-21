@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import signal
@@ -14,6 +15,58 @@ from pathlib import Path
 
 MIN_IMPROVEMENT: float | None = None
 TIMEOUT_SECONDS = 600
+
+RUN_FILE = "run.json"
+RUN_FIELDS: tuple[tuple[str, type], ...] = (
+    ("run_tag", str),
+    ("run_start", str),
+    ("baseline_commit", str),
+    ("eval_hash", str),
+    ("repeats", int),
+    ("z", float),
+    ("sigma", float),
+    ("min_improvement", float),
+    ("queue_limit", int),
+    ("rotate_after", int),
+)
+
+
+def read_run(repo: Path) -> dict | None:
+    path = repo / RUN_FILE
+    if not path.is_file():
+        return None
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    for name, kind in RUN_FIELDS:
+        if name not in config:
+            return None
+        value = config[name]
+        if kind is float and isinstance(value, int) and not isinstance(value, bool):
+            config[name] = float(value)
+            continue
+        if not isinstance(value, kind) or isinstance(value, bool):
+            return None
+    return config
+
+
+def write_run(repo: Path, config: dict) -> None:
+    path = repo / RUN_FILE
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def band_for(sigma: float, z: float, n: int) -> float:
+    count = n if n >= 1 else 1
+    return z * sigma * math.sqrt(1.0 + 1.0 / count)
 
 COUNTED_DECISIONS = frozenset({
     "好于父本",

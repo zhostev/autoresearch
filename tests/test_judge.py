@@ -1,3 +1,4 @@
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -667,3 +668,72 @@ class TestEvalHash(unittest.TestCase):
         self.assertEqual(
             judge.data_manifest(self.data), "a.parquet 3\nsub/b.parquet 2\n"
         )
+
+
+class TestRunConfig(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _good(self):
+        return {
+            "run_tag": "mar5",
+            "run_start": "2026-10-21T15:22:00+08:00",
+            "baseline_commit": "a" * 40,
+            "eval_hash": "b" * 64,
+            "repeats": 5,
+            "z": 2.0,
+            "sigma": 0.004,
+            "min_improvement": 0.008,
+            "queue_limit": 2,
+            "rotate_after": 8,
+        }
+
+    def test_round_trip(self):
+        judge.write_run(self.root, self._good())
+        self.assertEqual(judge.read_run(self.root), self._good())
+
+    def test_missing_file_is_none(self):
+        self.assertIsNone(judge.read_run(self.root))
+
+    def test_broken_json_is_none(self):
+        (self.root / "run.json").write_text("{not json", encoding="utf-8")
+        self.assertIsNone(judge.read_run(self.root))
+
+    def test_missing_field_is_none(self):
+        import json
+
+        bad = self._good()
+        del bad["sigma"]
+        (self.root / "run.json").write_text(json.dumps(bad), encoding="utf-8")
+        self.assertIsNone(judge.read_run(self.root))
+
+    def test_wrong_type_is_none(self):
+        import json
+
+        bad = self._good()
+        bad["repeats"] = "five"
+        (self.root / "run.json").write_text(json.dumps(bad), encoding="utf-8")
+        self.assertIsNone(judge.read_run(self.root))
+
+    def test_band_widens_as_the_parent_gets_noisier(self):
+        self.assertAlmostEqual(
+            judge.band_for(0.004, 2.0, 1), 2.0 * 0.004 * math.sqrt(2.0), places=12
+        )
+        self.assertAlmostEqual(
+            judge.band_for(0.004, 2.0, 2), 2.0 * 0.004 * math.sqrt(1.5), places=12
+        )
+        self.assertAlmostEqual(
+            judge.band_for(0.004, 2.0, 5), 2.0 * 0.004 * math.sqrt(1.2), places=12
+        )
+        self.assertGreater(judge.band_for(0.004, 2.0, 1), judge.band_for(0.004, 2.0, 5))
+
+    def test_band_falls_back_to_one_sample_on_bad_n(self):
+        expected = judge.band_for(0.004, 2.0, 1)
+        self.assertEqual(judge.band_for(0.004, 2.0, 0), expected)
+        self.assertEqual(judge.band_for(0.004, 2.0, -3), expected)
