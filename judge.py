@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -340,6 +341,24 @@ def blank_row() -> dict:
     return {field: "" for field in RESULT_FIELDS}
 
 
+CONSTANT_LINE = re.compile(r"^[+-]([A-Z][A-Z0-9_]*)[ \t]*=(?!=)")
+
+
+def touched_constants(diff_text: str) -> set[str]:
+    found: set[str] = set()
+    for line in diff_text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        match = CONSTANT_LINE.match(line)
+        if match is not None:
+            found.add(match.group(1))
+    return found
+
+
+def parse_knobs(raw: str) -> set[str]:
+    return {item.strip() for item in raw.split(",") if item.strip() != ""}
+
+
 def validate_text(seed: str, mechanism: str, expect: str, fail: str) -> str | None:
     if seed not in {"1", "2"}:
         return "种子只允许 1 或 2"
@@ -391,6 +410,7 @@ def main(
     trial = sub.add_parser("trial")
     trial.add_argument("--seed", required=True)
     trial.add_argument("--mechanism", required=True)
+    trial.add_argument("--knobs", default=None)
     trial.add_argument("--expect", required=True)
     trial.add_argument("--fail", required=True)
     args = parser.parse_args(argv)
@@ -442,6 +462,13 @@ def main(
         ]
         if not parent_scores:
             return 2
+        if args.knobs is None:
+            return 2
+        diff = git_output(repo, "diff", parent, head, "--", "train.py")
+        if diff is None:
+            return 2
+        if touched_constants(diff) != parse_knobs(args.knobs):
+            return 2
     task_py, prepare_py, data_root = eval_paths(repo, root is not None)
     identity = eval_hash(task_py, prepare_py, data_root)
     row = blank_row()
@@ -449,6 +476,7 @@ def main(
         "commit": head,
         "parent": git_output(repo, "rev-parse", "HEAD^") or "",
         "mechanism": args.mechanism,
+        "knobs": ",".join(sorted(parse_knobs(args.knobs or ""))) if args.seed == "1" else "",
         "expect": args.expect,
         "fail": args.fail,
         "seed": args.seed,

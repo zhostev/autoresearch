@@ -328,7 +328,7 @@ class TestTrial(unittest.TestCase):
         judge.write_run(self.root, config)
         return config
 
-    def _prepare_child(self, sigma=0.004):
+    def _prepare_child(self, sigma=0.004, train_text="print('next')\n"):
         parent = git_head(self.root)
         self._write_run(sigma)
         judge.write_parents(self.root / "parents.tsv", [{
@@ -342,7 +342,7 @@ class TestTrial(unittest.TestCase):
         base = self._done_row("基线", "1", "基线", "1.000000")
         base["commit"] = parent
         judge.append_result(self.root / "results.tsv", base)
-        (self.root / "train.py").write_text("print('next')\n", encoding="utf-8")
+        (self.root / "train.py").write_text(train_text, encoding="utf-8")
         self._git("add", "train.py")
         self._git("commit", "-m", "try")
         return parent
@@ -363,7 +363,7 @@ class TestTrial(unittest.TestCase):
         self._prepare_child()
         before = (self.root / "results.tsv").read_text(encoding="utf-8")
         code = self._trial(
-            ["--seed", "1", "--mechanism", "基线", "--expect", "lower", "--fail", "崩了"],
+            ["--seed", "1", "--mechanism", "基线", "--knobs", "", "--expect", "lower", "--fail", "崩了"],
             [sys.executable, "-c", "print('seed: 1'); print('val_bpb:          0.900000')"],
         )
         self.assertEqual(code, 2)
@@ -410,7 +410,7 @@ class TestTrial(unittest.TestCase):
 
     def test_tab_in_fail_writes_nothing(self):
         code = self._trial(
-            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "a\tb"],
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "", "--expect", "lower", "--fail", "a\tb"],
             ["python", "-c", "print('no')"],
         )
         self.assertEqual(code, 2)
@@ -419,7 +419,7 @@ class TestTrial(unittest.TestCase):
     def test_dirty_train_py_writes_nothing(self):
         (self.root / "train.py").write_text("print('dirty')\n", encoding="utf-8")
         code = self._trial(
-            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "", "--expect", "lower", "--fail", "崩了"],
             ["python", "-c", "print('no')"],
         )
         self.assertEqual(code, 2)
@@ -428,7 +428,7 @@ class TestTrial(unittest.TestCase):
     def test_duplicate_seed_writes_nothing(self):
         judge.append_result(self.root / "results.tsv", self._done_row("学习率", "1"))
         code = self._trial(
-            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "", "--expect", "lower", "--fail", "崩了"],
             ["python", "-c", "print('no')"],
         )
         self.assertEqual(code, 2)
@@ -439,7 +439,7 @@ class TestTrial(unittest.TestCase):
 
         self._prepare_child()
         code = self._trial(
-            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "", "--expect", "lower", "--fail", "崩了"],
             [sys.executable, "-c", "import time; time.sleep(30)"],
             timeout=0.2,
         )
@@ -462,7 +462,7 @@ class TestTrial(unittest.TestCase):
             "child.wait()",
         ])
         code = self._trial(
-            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "", "--expect", "lower", "--fail", "崩了"],
             [sys.executable, "-c", script],
             timeout=1,
         )
@@ -503,7 +503,7 @@ class TestTrial(unittest.TestCase):
 
         self._prepare_child()
         code = self._trial(
-            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "", "--expect", "lower", "--fail", "崩了"],
             [sys.executable, "-c", "print('seed: 9'); print('val_bpb:          0.900000')"],
         )
         self.assertEqual(code, 0)
@@ -562,7 +562,7 @@ class TestCommands(TestTrial):
         self._prepare_child()
         child = git_head(self.root)
         code = judge.main(
-            ["trial", "--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "变高"],
+            ["trial", "--seed", "1", "--mechanism", "学习率", "--knobs", "", "--expect", "lower", "--fail", "变高"],
             command=[
                 sys.executable, "-c",
                 "print('seed: 1'); print('val_bpb:          0.900000')",
@@ -854,3 +854,92 @@ class TestNoiseBand(unittest.TestCase):
         self.assertEqual(judge.parent_n({"seeds": "   "}), 1)
         self.assertEqual(judge.parent_n({}), 1)
         self.assertEqual(judge.parent_n({"seeds": ",,"}), 1)
+
+
+class TestKnobs(unittest.TestCase):
+    def test_constant_assignment_on_both_sides(self):
+        diff = (
+            "--- a/train.py\n"
+            "+++ b/train.py\n"
+            "-IMAGE_SIZE = 128\n"
+            "+IMAGE_SIZE = 160\n"
+        )
+        self.assertEqual(judge.touched_constants(diff), {"IMAGE_SIZE"})
+
+    def test_diff_headers_are_not_constants(self):
+        diff = "--- a/train.py\n+++ b/train.py\n"
+        self.assertEqual(judge.touched_constants(diff), set())
+
+    def test_comparison_is_not_an_assignment(self):
+        diff = "+IMAGE_SIZE == 160\n+    if BATCH_SIZE == 2:\n"
+        self.assertEqual(judge.touched_constants(diff), set())
+
+    def test_indented_assignment_is_not_module_level(self):
+        diff = "+    IMAGE_SIZE = 160\n"
+        self.assertEqual(judge.touched_constants(diff), set())
+
+    def test_structural_change_touches_nothing(self):
+        diff = (
+            "-        loss.backward()\n"
+            "-        optimizer.step()\n"
+            "+        scaler.scale(loss).backward()\n"
+            "+        scaler.step(optimizer)\n"
+        )
+        self.assertEqual(judge.touched_constants(diff), set())
+
+    def test_several_constants(self):
+        diff = "+IMAGE_SIZE = 176\n+BATCH_SIZE = 48\n"
+        self.assertEqual(judge.touched_constants(diff), {"IMAGE_SIZE", "BATCH_SIZE"})
+
+    def test_assignment_at_end_of_line(self):
+        self.assertEqual(judge.touched_constants("+IMAGE_SIZE =\n"), {"IMAGE_SIZE"})
+
+    def test_parse_knobs_normalises(self):
+        self.assertEqual(judge.parse_knobs(""), set())
+        self.assertEqual(judge.parse_knobs("  "), set())
+        self.assertEqual(judge.parse_knobs("A, B ,A"), {"A", "B"})
+        self.assertEqual(judge.parse_knobs("IMAGE_SIZE"), {"IMAGE_SIZE"})
+
+
+class TestKnobsGate(TestTrial):
+    def test_undeclared_constant_is_refused(self):
+        self._prepare_child(train_text="IMAGE_SIZE = 160\n")
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "半精度", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), 1)
+
+    def test_matching_declaration_is_allowed(self):
+        self._prepare_child(train_text="IMAGE_SIZE = 160\n")
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "分辨率", "--knobs", "IMAGE_SIZE",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.900000"),
+        )
+        self.assertEqual(code, 0)
+        rows = judge.read_results(self.root / "results.tsv")
+        self.assertEqual(rows[-1]["knobs"], "IMAGE_SIZE")
+
+    def test_extra_constant_is_refused(self):
+        self._prepare_child(train_text="IMAGE_SIZE = 160\nBATCH_SIZE = 48\n")
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "分辨率", "--knobs", "IMAGE_SIZE",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), 1)
+
+
+class TestKnobsRequiredOnSeed1(TestTrial):
+    def test_seed1_without_knobs_is_refused(self):
+        self._prepare_child()
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), 1)
