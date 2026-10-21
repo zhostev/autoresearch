@@ -11,6 +11,7 @@ To set up a new experiment, work with the user to:
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
+   - `task.py` — the frozen ruler: data root, time budget, the validation set, and the metric. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 5. **Do not create the tables by hand**: Leave `results.tsv`, `parents.tsv`, `queue.tsv`, and `run.json` uncreated. `uv run judge.py calibrate` writes the baseline rows, the parent list, and the calibration.
@@ -29,16 +30,17 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 - `git reset` a commit you decided not to keep.
 
 **What you CANNOT do:**
-- Modify `prepare.py` or `judge.py`.
-- Edit `results.tsv` or `parents.tsv` by hand.
+- Modify `prepare.py`, `judge.py`, or `task.py`.
+- Edit `results.tsv`, `parents.tsv`, `queue.tsv`, or `run.json` by hand.
 - Install new packages or add dependencies.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify the evaluation harness. `task.score` is the ground truth metric, and `task.load_val` is the only source of a validation set. Take the training loader from `task.load_train` too; never build your own loader over the data directory.
+- Change the ruler mid-run. `judge.py` hashes `task.py`, `prepare.py`, and the data directory into one `eval_hash`. If it stops matching `run.json`, every command except `report` refuses until the human recalibrates, and the night's results split into two incomparable halves.
 - Hardcode a random seed. `train.py` must keep the `seed_everything()` call.
 - Treat a parent-list update as a validated claim. Do not call a parent-list update a validated claim.
 
 **The goal is simple: get the lowest val_bpb.** The time budget stays 5 minutes. VRAM is a soft constraint. Some increase is acceptable for a meaningful gain, but it should not blow up dramatically.
 
-**Simplicity:** You judge whether added code is worth the gain. `judge.py` does not measure simplicity. A strictly lower seed-1 `val_bpb` may enter the parent list only if you then run `accept`. An equal seed-1 score can replace a listed parent only through `accept --simpler`. A higher seed-1 score never enters the list.
+**Simplicity:** You judge whether added code is worth the gain. `judge.py` does not measure simplicity. A seed-1 `val_bpb` that clears the noise band (`好于父本`) may enter the parent list only if you then run `accept`. A score inside the band (`分不开`) can replace *its own parent* through `accept --simpler --replace <that parent>`, and only when the code is simpler. A score above the band never enters the list.
 
 ## The experiment loop
 

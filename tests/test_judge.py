@@ -1508,3 +1508,229 @@ class TestMissingScoreBeatsHashAlarm(unittest.TestCase):
             0.9, 0.9, 1.0, 1.0, ["e", "f", "e", "e"], 0.001, 1
         )
         self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
+
+
+class TestKnobsRegexCoverage(unittest.TestCase):
+    def test_annotated_assignment_counts(self):
+        self.assertEqual(
+            judge.touched_constants("+IMAGE_SIZE: int = 160\n"), {"IMAGE_SIZE"}
+        )
+
+    def test_augmented_assignment_counts(self):
+        self.assertEqual(
+            judge.touched_constants("+LEARNING_RATE *= 2\n"), {"LEARNING_RATE"}
+        )
+        self.assertEqual(judge.touched_constants("+WARMUP //= 2\n"), {"WARMUP"})
+        self.assertEqual(judge.touched_constants("+DECAY **= 2\n"), {"DECAY"})
+
+    def test_tuple_target_counts_every_name(self):
+        self.assertEqual(
+            judge.touched_constants("+IMAGE_SIZE, BATCH_SIZE = 160, 64\n"),
+            {"IMAGE_SIZE", "BATCH_SIZE"},
+        )
+
+    def test_comparison_is_still_not_an_assignment(self):
+        self.assertEqual(judge.touched_constants("+IMAGE_SIZE == 160\n"), set())
+        self.assertEqual(judge.touched_constants("+    if BATCH_SIZE == 2:\n"), set())
+
+
+class TestRecalibrationGuard(TestCalibrate):
+    def _values(self):
+        return ["1.000000", "1.004000", "0.996000", "1.002000", "0.998000"]
+
+    def test_recalibrating_without_force_is_refused(self):
+        self.assertEqual(self._calibrate(self._values()), 0)
+        before = judge.read_parents(self.root / "parents.tsv")
+        rows_before = len(judge.read_results(self.root / "results.tsv"))
+        self.assertEqual(self._calibrate(self._values()), 2)
+        self.assertEqual(judge.read_parents(self.root / "parents.tsv"), before)
+        self.assertEqual(
+            len(judge.read_results(self.root / "results.tsv")), rows_before
+        )
+
+    def test_forced_recalibration_clears_the_queue(self):
+        self.assertEqual(self._calibrate(self._values()), 0)
+        judge.write_queue(self.root / "queue.tsv", [{
+            "commit": git_head(self.root), "parent": "p", "mechanism": "学习率",
+            "accepted_at": "t", "state": "待复核",
+        }])
+        code = judge.main(
+            ["calibrate", "--force"],
+            command=self._fake_scores(self._values()),
+            timeout_seconds=5,
+            root=self.root,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(judge.read_queue(self.root / "queue.tsv"), [])
+
+
+class TestTruncatedRows(TestTrial):
+    def test_read_results_pads_a_short_row(self):
+        path = self.root / "results.tsv"
+        path.write_text(judge.RESULT_HEADER + "\nabc\tdef\n", encoding="utf-8")
+        row = judge.read_results(path)[0]
+        self.assertEqual(row["commit"], "abc")
+        self.assertEqual(row["detail"], "")
+        self.assertEqual(row["eval_hash"], "")
+
+    def test_the_report_survives_a_truncated_row(self):
+        path = self.root / "results.tsv"
+        path.write_text(judge.RESULT_HEADER + "\nabc\tdef\n", encoding="utf-8")
+        self.assertEqual(judge.main(["report"], root=self.root), 0)
+        self.assertIn("## 已验证结论", (self.root / "REPORT.md").read_text(encoding="utf-8"))
+
+
+class TestManifestIgnoresScratchFiles(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self._tmp.name) / "data"
+        self.data.mkdir()
+        (self.data / "a.parquet").write_bytes(b"aaa")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_partial_downloads_do_not_move_the_ruler(self):
+        before = judge.data_manifest(self.data)
+        (self.data / "shard_00007.parquet.tmp").write_bytes(b"half")
+        self.assertEqual(judge.data_manifest(self.data), before)
+
+    def test_dotfiles_do_not_move_the_ruler(self):
+        before = judge.data_manifest(self.data)
+        (self.data / ".DS_Store").write_bytes(b"junk")
+        self.assertEqual(judge.data_manifest(self.data), before)
+
+
+class TestTaskCoversTheTokenizer(unittest.TestCase):
+    def test_data_root_is_the_cache_dir_not_just_data(self):
+        text = Path("task.py").read_text(encoding="utf-8")
+        self.assertIn("DATA_ROOT = Path(prepare.CACHE_DIR)", text)
+        self.assertNotIn("DATA_ROOT = Path(prepare.DATA_DIR)", text)
+
+    def test_train_takes_its_loader_from_task(self):
+        text = Path("train.py").read_text(encoding="utf-8")
+        self.assertNotIn("make_dataloader", text)
+        self.assertIn("load_train", text)
+
+
+class TestReportCountsTrialsOnly(unittest.TestCase):
+    def _config(self):
+        return {
+            "run_tag": "mar5", "run_start": "t", "baseline_commit": "a" * 40,
+            "eval_hash": "e" * 64, "repeats": 5, "z": 2.0, "sigma": 0.004,
+            "min_improvement": 0.008, "queue_limit": 2, "rotate_after": 8,
+        }
+
+    def _row(self, seed, decision, eval_hash):
+        return {
+            "commit": "b" * 40, "parent": "a" * 40, "mechanism": "学习率",
+            "knobs": "", "expect": "lower", "fail": "崩了", "seed": seed,
+            "val_bpb": "0.9", "eval_hash": eval_hash, "decision": decision,
+            "detail": "",
+        }
+
+    def test_bookkeeping_rows_do_not_form_a_ruler_group(self):
+        rows = [
+            self._row("1", "好于父本", "e" * 64),
+            self._row("*", "进入名单", "e" * 64),
+            self._row("*", "成立", ""),
+        ]
+        text = judge.build_report(self._config(), rows, [], [])
+        counts = text.split("## 轮次统计", 1)[1].split("## 搜索结果", 1)[0]
+        self.assertIn("好于父本", counts)
+        self.assertNotIn("进入名单", counts)
+        self.assertNotIn("### 尺子 \n", counts)
+
+    def test_a_hold_is_still_listed_as_verified(self):
+        rows = [self._row("*", "成立", "")]
+        text = judge.build_report(self._config(), rows, [], [])
+        verified = text.split("## 已验证结论", 1)[1].split("##", 1)[0]
+        self.assertIn("b" * 7, verified)
+
+
+class TestInstructionsNameTheFrozenTask(unittest.TestCase):
+    def setUp(self):
+        self.text = Path("program.md").read_text(encoding="utf-8")
+
+    def test_task_py_is_listed_as_out_of_bounds(self):
+        self.assertIn("task.py", self.text)
+
+    def test_no_v1_exact_score_semantics_remain(self):
+        self.assertNotIn("A strictly lower seed-1", self.text)
+        self.assertNotIn("An equal seed-1 score", self.text)
+
+
+class TestRefusalsSpeak(TestTrial):
+    def _stderr_of(self, call):
+        import contextlib
+        import io
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = call()
+        return code, buffer.getvalue()
+
+    def test_a_dirty_tree_says_so(self):
+        self._prepare_child()
+        (self.root / "train.py").write_text("dirty\n", encoding="utf-8")
+        code, err = self._stderr_of(lambda: self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        ))
+        self.assertEqual(code, 2)
+        self.assertIn("工作区", err)
+
+    def test_an_undeclared_knob_says_so(self):
+        self._prepare_child(train_text="IMAGE_SIZE = 160\n")
+        code, err = self._stderr_of(lambda: self._trial(
+            ["--seed", "1", "--mechanism", "半精度", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        ))
+        self.assertEqual(code, 2)
+        self.assertIn("IMAGE_SIZE", err)
+
+    def test_a_parent_outside_the_list_says_so(self):
+        self._write_run()
+        (self.root / "train.py").write_text("print('x')\n", encoding="utf-8")
+        self._git("add", "train.py")
+        self._git("commit", "-m", "orphan")
+        code, err = self._stderr_of(lambda: self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        ))
+        self.assertEqual(code, 2)
+        self.assertIn("父本", err)
+
+    def test_rotation_refusal_says_so(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        judge.write_parents(self.root / "parents.tsv", [
+            {"commit": parent, "mechanism": "基线", "val_bpb": "1.000000",
+             "seeds": "1,2,3,4,5", "reviewed": "yes", "simpler": "no"},
+            {"commit": "f" * 40, "mechanism": "别的", "val_bpb": "0.5",
+             "seeds": "1", "reviewed": "no", "simpler": "no"},
+        ])
+        for index in range(8):
+            row = self._done_row("机制%d" % index, "1", "差于父本", "1.100000")
+            row["commit"] = "%040d" % index
+            row["parent"] = parent
+            judge.append_result(self.root / "results.tsv", row)
+        code, err = self._stderr_of(lambda: self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        ))
+        self.assertEqual(code, 2)
+        self.assertIn("换", err)
+
+    def test_every_refusal_path_is_wired_to_the_helper(self):
+        import re
+
+        source = Path("judge.py").read_text(encoding="utf-8")
+        body = source.split("def refuse(", 1)[1].split("\n\n\n", 1)[1]
+        self.assertEqual(re.findall(r"^\s*return 2$", body, re.M), [])

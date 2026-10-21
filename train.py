@@ -23,8 +23,8 @@ cap = torch.cuda.get_device_capability()
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
 fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, Tokenizer, make_dataloader, seed_everything
-from task import TIME_BUDGET, score
+from prepare import MAX_SEQ_LEN, Tokenizer, seed_everything
+from task import TIME_BUDGET, load_train, score
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -508,7 +508,7 @@ optimizer = model.setup_optimizer(
 
 model = torch.compile(model, dynamic=False)
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = load_train(tokenizer, DEVICE_BATCH_SIZE)
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")

@@ -306,6 +306,8 @@ def read_results(path: Path) -> list[dict]:
         if line == "":
             continue
         parts = line.split("\t")
+        if len(parts) < len(RESULT_FIELDS):
+            parts = parts + [""] * (len(RESULT_FIELDS) - len(parts))
         rows.append(dict(zip(RESULT_FIELDS, parts)))
     return rows
 
@@ -383,6 +385,8 @@ def build_report(
     out += ["", "## 轮次统计", ""]
     groups: dict[str, dict[str, int]] = {}
     for row in rows:
+        if row["seed"] == "*":
+            continue
         key = row["eval_hash"]
         groups.setdefault(key, {})
         groups[key][row["decision"]] = groups[key].get(row["decision"], 0) + 1
@@ -480,6 +484,8 @@ def data_manifest(data_root: Path) -> str | None:
     for path in data_root.rglob("*"):
         if path.is_symlink() or not path.is_file():
             continue
+        if path.name.startswith(".") or path.name.endswith(".tmp"):
+            continue
         entries.append((path.relative_to(data_root).as_posix(), path.stat().st_size))
     entries.sort(key=lambda item: item[0])
     return "".join(f"{name} {size}\n" for name, size in entries)
@@ -546,7 +552,10 @@ def blank_row() -> dict:
     return {field: "" for field in RESULT_FIELDS}
 
 
-CONSTANT_LINE = re.compile(r"^[+-]([A-Z][A-Z0-9_]*)[ \t]*=(?!=)")
+CONSTANT_LINE = re.compile(
+    r"^[+-]([A-Z][A-Z0-9_]*(?:[ \t]*,[ \t]*[A-Z][A-Z0-9_]*)*)"
+    r"[ \t]*(?::[^=]*)?(?:\*\*|//|>>|<<|[-+*/%@|&^])?=(?!=)"
+)
 
 
 def touched_constants(diff_text: str) -> set[str]:
@@ -556,7 +565,8 @@ def touched_constants(diff_text: str) -> set[str]:
             continue
         match = CONSTANT_LINE.match(line)
         if match is not None:
-            found.add(match.group(1))
+            for name in match.group(1).split(","):
+                found.add(name.strip())
     return found
 
 
@@ -607,8 +617,10 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(prog="judge.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("calibrate", "claim", "report"):
+    for name in ("claim", "report"):
         sub.add_parser(name)
+    calibrate_parser = sub.add_parser("calibrate")
+    calibrate_parser.add_argument("--force", action="store_true")
     accept_parser = sub.add_parser("accept")
     accept_parser.add_argument("--simpler", action="store_true")
     accept_parser.add_argument("--replace", default=None)
@@ -629,18 +641,21 @@ def main(
             command or ["uv", "run", "train.py"],
             TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds,
             root is not None,
+            args.force,
         )
     if args.cmd == "accept":
         return cmd_accept(repo, args.simpler, args.replace, root is not None)
     if args.cmd == "claim":
         return cmd_claim(repo, root is not None)
     if args.cmd != "trial":
-        return 2
+        return refuse("不认识这个子命令")
     timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     train = command or ["uv", "run", "train.py"]
     error = validate_text(args.seed, args.mechanism, args.expect, args.fail)
-    if error is not None or is_dirty(repo):
-        return 2
+    if error is not None:
+        return refuse(error)
+    if is_dirty(repo):
+        return refuse("工作区不干净：train.py / prepare.py / judge.py / task.py 有未提交改动")
     config = read_run(repo)
     if config is None:
         return refuse("还没标定：先运行 judge.py calibrate")
@@ -648,7 +663,7 @@ def main(
         return refuse("尺子变了：task.py、prepare.py 或数据目录与 run.json 不一致，需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
     results_path = repo / "results.tsv"
     rows = read_results(results_path)
     if any(
@@ -665,30 +680,38 @@ def main(
             and row["decision"] in {"基线", "好于父本", "分不开", "差于父本"}
         ]
         if not seed1 or seed1[-1]["mechanism"] != args.mechanism:
-            return 2
+            return refuse("种子 2 要求这个提交已有同名机制的种子 1 完成记录")
     else:
         parent = git_output(repo, "rev-parse", "HEAD^")
         listed = {row["commit"] for row in read_parents(repo / "parents.tsv")}
         if parent is None or parent not in listed:
-            return 2
+            return refuse("这个提交的父本不在 parents.tsv 名单里")
         parent_scores = [
             item for item in rows
             if item["commit"] == parent and item["seed"] == "1" and item["val_bpb"] != ""
         ]
         if not parent_scores:
-            return 2
+            return refuse("父本还没有种子 1 的分数")
         if args.knobs is None:
-            return 2
+            return refuse("种子 1 必须声明 --knobs（没改常量就写 --knobs \"\"）")
         diff = git_output(repo, "diff", parent, head, "--", "train.py")
         if diff is None:
-            return 2
-        if touched_constants(diff) != parse_knobs(args.knobs):
-            return 2
+            return refuse("读不出 train.py 相对父本的 diff")
+        touched = touched_constants(diff)
+        declared = parse_knobs(args.knobs)
+        if touched != declared:
+            return refuse(
+                "声明的旋钮和 diff 对不上：diff 改了 "
+                f"{'、'.join(sorted(touched)) or '（无）'}，声明的是 "
+                f"{'、'.join(sorted(declared)) or '（无）'}"
+            )
         if rotation_blocked(
             rows, len(read_parents(repo / "parents.tsv")), parent,
             config["rotate_after"],
         ):
-            return 2
+            return refuse(
+                f"连续 {config['rotate_after']} 次都从这个父本出发了，换一个起点"
+            )
         queue_path = repo / "queue.tsv"
         queue_rows = read_queue(queue_path)
         pruned = prune_queue(repo, queue_rows)
@@ -696,12 +719,10 @@ def main(
             write_queue(queue_path, pruned)
         if len(pruned) > config["queue_limit"]:
             head_entry = pruned[0]
-            print(
+            return refuse(
                 f"队列积压 {len(pruned)} 条，先复核 {head_entry['commit'][:7]}"
-                f"（{head_entry['mechanism']}）",
-                file=sys.stderr,
+                f"（{head_entry['mechanism']}）"
             )
-            return 2
     task_py, prepare_py, data_root = eval_paths(repo, root is not None)
     identity = eval_hash(task_py, prepare_py, data_root)
     row = blank_row()
@@ -773,13 +794,18 @@ def calibration(scores: list[float], z: float) -> tuple[float, float]:
 
 
 def cmd_calibrate(
-    repo: Path, command: list[str], timeout: float, test_root: bool
+    repo: Path, command: list[str], timeout: float, test_root: bool,
+    force: bool = False,
 ) -> int:
     if is_dirty(repo):
-        return 2
+        return refuse("工作区不干净")
+    if read_run(repo) is not None and not force:
+        return refuse(
+            "已经标定过了：重新标定会清空父本名单和复核队列，确认请加 --force"
+        )
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
     task_py, prepare_py, data_root = eval_paths(repo, test_root)
     identity = eval_hash(task_py, prepare_py, data_root)
     results_path = repo / "results.tsv"
@@ -791,7 +817,7 @@ def cmd_calibrate(
             "detail": "数据身份不可用",
         })
         append_result(results_path, row)
-        return 2
+        return refuse("数据身份不可用：task.DATA_ROOT 不存在")
     repeats = 5
     z = 2.0
     scores: list[float] = []
@@ -809,18 +835,18 @@ def cmd_calibrate(
         if code != 0 or printed_bpb is None:
             row["decision"] = "代码坏了"
             append_result(results_path, row)
-            return 2
+            return refuse(f"标定第 {seed} 次训练崩了，整次标定作废")
         if printed_seed != seed:
             row["decision"] = "测量失败"
             append_result(results_path, row)
-            return 2
+            return refuse(f"标定第 {seed} 次打印的种子不是 {seed}，整次标定作废")
         row["val_bpb"] = printed_bpb
         row["decision"] = "基线"
         append_result(results_path, row)
         scores.append(float(printed_bpb))
     sigma, min_improvement = calibration(scores, z)
     if sigma <= 0.0:
-        return 2
+        return refuse("五次基线分数完全相同，测不出噪声；这个任务的判定会退化成精确比较")
     tag = git_output(repo, "rev-parse", "--abbrev-ref", "HEAD") or ""
     write_run(repo, {
         "run_tag": tag.rsplit("/", 1)[-1],
@@ -843,6 +869,7 @@ def cmd_calibrate(
         "reviewed": "yes",
         "simpler": "no",
     }])
+    write_queue(repo / "queue.tsv", [])
     write_report(repo)
     return 0
 
@@ -859,17 +886,17 @@ def cmd_accept(
         return refuse("尺子变了：需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
     seed1 = _latest(read_results(repo / "results.tsv"), head, "1")
     if seed1 is None:
-        return 2
+        return refuse("这个提交没有种子 1 记录，不能 accept")
     if simpler:
         if seed1["decision"] != "分不开" or not replace_commit:
             return refuse("--simpler 只接受判定为「分不开」且指定了 --replace 的提交")
         if replace_commit != seed1["parent"]:
             return refuse("--replace 只能指名这个提交自己的父本")
     elif seed1["decision"] != "好于父本":
-        return 2
+        return refuse(f"判定是「{seed1['decision']}」，只有「好于父本」才能 accept")
     newcomer = {
         "commit": head,
         "mechanism": seed1["mechanism"],
@@ -885,7 +912,7 @@ def cmd_accept(
             replace_commit if simpler else None,
         )
     except ValueError:
-        return 2
+        return refuse("--replace 指定的提交不在名单里")
     result = blank_row()
     result.update({
         "commit": head,
@@ -927,7 +954,7 @@ def cmd_claim(repo: Path, test_root: bool) -> int:
         return refuse("尺子变了：需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
     parent = git_output(repo, "rev-parse", "HEAD^")
     rows = read_results(repo / "results.tsv")
     result = blank_row()
