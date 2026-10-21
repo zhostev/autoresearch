@@ -1880,3 +1880,123 @@ class TestAuditOnlySearchRows(unittest.TestCase):
         text = judge.build_report(None, rows, [], [])
         audit = text.split("## 机制审计", 1)[1]
         self.assertIn("容量", audit)
+
+
+class TestBandAcrossBothArms(unittest.TestCase):
+    def test_more_candidate_samples_tighten_the_band(self):
+        one = judge.band_for(0.004, 2.0, 5)
+        three = judge.band_for(0.004, 2.0, 5, 3)
+        self.assertAlmostEqual(one, 2.0 * 0.004 * math.sqrt(1.0 + 1.0 / 5), places=12)
+        self.assertAlmostEqual(
+            three, 2.0 * 0.004 * math.sqrt(1.0 / 3 + 1.0 / 5), places=12
+        )
+        self.assertLess(three, one)
+
+    def test_one_candidate_sample_is_the_old_behaviour(self):
+        self.assertEqual(judge.band_for(0.004, 2.0, 2, 1), judge.band_for(0.004, 2.0, 2))
+
+    def test_bad_counts_fall_back_to_one(self):
+        expected = judge.band_for(0.004, 2.0, 1, 1)
+        self.assertEqual(judge.band_for(0.004, 2.0, 0, 0), expected)
+
+
+class TestEscalation(TestTrial):
+    """Δ<0 的候选追加测量，用均值重判。"""
+
+    def _train_table(self, values: dict):
+        table = ", ".join(f"'{k}': '{v}'" for k, v in values.items())
+        script = self.root / "table_train.py"
+        script.write_text(
+            "import os\n"
+            f"table = {{{table}}}\n"
+            "seed = os.environ['AUTORES_SEED']\n"
+            "print('seed: ' + seed)\n"
+            "print('val_bpb:          ' + table[seed])\n",
+            encoding="utf-8",
+        )
+        return [sys.executable, str(script)]
+
+    def _run(self, values):
+        self._prepare_child()
+        return self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._train_table(values),
+            timeout=10,
+        )
+
+    def _rows(self):
+        return judge.read_results(self.root / "results.tsv")
+
+    def test_a_candidate_no_better_than_its_parent_is_measured_once(self):
+        self.assertEqual(self._run({"1": "1.002000"}), 0)
+        trials = [r for r in self._rows() if r["mechanism"] == "学习率"]
+        self.assertEqual(len(trials), 1)
+        self.assertEqual(trials[0]["seed"], "1")
+        self.assertEqual(trials[0]["decision"], "分不开")
+
+    def test_a_lucky_first_draw_is_pulled_back_to_its_mean(self):
+        # 单次抽样下 0.990 会判「好于父本」；三次均值 0.99767 落回带内。
+        self.assertEqual(
+            self._run({"1": "0.990000", "2": "1.002000", "3": "1.001000"}), 0
+        )
+        trials = [r for r in self._rows() if r["mechanism"] == "学习率"]
+        self.assertEqual([r["seed"] for r in trials], ["2", "3", "1"])
+        verdict = trials[-1]
+        self.assertEqual(verdict["seed"], "1")
+        self.assertEqual(verdict["decision"], "分不开")
+        self.assertIn("3 次均值", verdict["detail"])
+        self.assertEqual([r["decision"] for r in trials[:2]], ["已记录", "已记录"])
+
+    def test_a_small_but_consistent_gain_becomes_visible(self):
+        # 单次抽样下 -0.0065 埋在 0.00876 的带里；三次均值把带收到 0.00584。
+        self.assertEqual(
+            self._run({"1": "0.993500", "2": "0.994000", "3": "0.993000"}), 0
+        )
+        verdict = [r for r in self._rows() if r["seed"] == "1"][-1]
+        self.assertEqual(verdict["decision"], "好于父本")
+
+    def test_an_already_measured_seed_is_not_run_twice(self):
+        self._prepare_child()
+        head = git_head(self.root)
+        seed2 = self._done_row("学习率", "2", "已记录", "1.002000")
+        seed2["commit"] = head
+        judge.append_result(self.root / "results.tsv", seed2)
+        self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._train_table({"1": "0.990000", "3": "1.001000"}),
+            timeout=10,
+        )
+        seeds = [r["seed"] for r in self._rows() if r["mechanism"] == "学习率"]
+        self.assertEqual(seeds.count("2"), 1)
+        verdict = [r for r in self._rows() if r["seed"] == "1"][-1]
+        self.assertEqual(verdict["decision"], "分不开")
+
+
+class TestParentBasisUsesEverySample(TestTrial):
+    def test_accept_lists_every_measured_seed(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        for seed, val in (("2", "0.902000"), ("3", "0.898000")):
+            row = self._done_row("学习率", seed, "已记录", val)
+            row["commit"] = head
+            judge.append_result(self.root / "results.tsv", row)
+        win = self._done_row("学习率", "1", "好于父本", "0.900000")
+        win["commit"] = head
+        win["parent"] = parent
+        judge.append_result(self.root / "results.tsv", win)
+        self.assertEqual(judge.main(["accept"], root=self.root), 0)
+        listed = [
+            r for r in judge.read_parents(self.root / "parents.tsv")
+            if r["commit"] == head
+        ][0]
+        self.assertEqual(listed["seeds"], "1,2,3")
+        self.assertAlmostEqual(float(listed["val_bpb"]), 0.900000, places=6)
+
+
+class TestInstructionsDescribeEscalation(unittest.TestCase):
+    def test_the_agent_is_told_a_trial_may_measure_three_times(self):
+        text = Path("program.md").read_text(encoding="utf-8")
+        self.assertIn("追加测量", text)
+        self.assertIn("trial_repeats", text)

@@ -78,7 +78,13 @@ uv run judge.py trial --seed 1 --mechanism 学习率 --knobs LEARNING_RATE \
 ```
 
 6. Read the new `results.tsv` row. `judge.py` does not create commits and does
-   not reset them.
+   not reset them. A trial that scores *worse* than its parent is measured once
+   and judged. A trial that scores better triggers 追加测量: judge runs the same
+   commit at seeds 2 and 3 (`trial_repeats` in `run.json`) and judges the mean of
+   all three against a band that is tighter because both arms now have more
+   samples. So a winning trial costs about three times the wall clock, and a
+   `分不开` that came back from three measurements is a much stronger statement
+   than one from a single draw — the detail column tells you which it was.
 7. If the decision is `好于父本` and the complexity is worth keeping, leave the
    commit and run `uv run judge.py accept`.
 8. If the decision is `分不开` and the code is simpler, leave the commit and run

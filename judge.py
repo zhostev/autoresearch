@@ -66,9 +66,11 @@ def write_run(repo: Path, config: dict) -> None:
     os.replace(temporary, path)
 
 
-def band_for(sigma: float, z: float, n: int) -> float:
-    count = n if n >= 1 else 1
-    return z * sigma * math.sqrt(1.0 + 1.0 / count)
+def band_for(sigma: float, z: float, n: int, m: int = 1) -> float:
+    """候选 m 次、父本 n 次时，两个均值之差的判定带。"""
+    parent = n if n >= 1 else 1
+    candidate = m if m >= 1 else 1
+    return z * sigma * math.sqrt(1.0 / candidate + 1.0 / parent)
 
 COUNTED_DECISIONS = frozenset({
     "好于父本",
@@ -78,6 +80,17 @@ COUNTED_DECISIONS = frozenset({
     "代码坏了",
     "测量失败",
 })
+
+
+def sample_scores(rows: list[dict], commit: str) -> dict[str, float]:
+    """这个提交所有正常跑完的种子分数，种子号 -> val_bpb。"""
+    found: dict[str, float] = {}
+    for row in rows:
+        if row["commit"] != commit or row["val_bpb"] == "":
+            continue
+        if row["decision"] in COMPLETED_DECISIONS:
+            found[row["seed"]] = float(row["val_bpb"])
+    return found
 
 
 def parent_n(parent_row: dict) -> int:
@@ -177,7 +190,8 @@ FINAL_CLAIMS = frozenset({"成立", "更差", "没有更好"})
 
 
 def apply_claim(
-    parents: list[dict], commit: str, decision: str, mean: float
+    parents: list[dict], commit: str, decision: str, mean: float,
+    seeds: str = "1,2",
 ) -> list[dict]:
     if decision not in FINAL_CLAIMS:
         return list(parents)
@@ -194,7 +208,7 @@ def apply_claim(
         fresh["reviewed"] = "yes"
         if decision != "更差":
             fresh["val_bpb"] = f"{mean:.6f}"
-            fresh["seeds"] = "1,2"
+            fresh["seeds"] = seeds
         updated.append(fresh)
     return updated
 
@@ -821,8 +835,51 @@ def main(
         float(parent_listed["val_bpb"]) if parent_listed is not None
         else float(parent_rows[-1]["val_bpb"])
     )
-    band = band_for(config["sigma"], config["z"], parent_n(parent_listed or {}))
-    row["decision"] = compare_to_parent(float(printed_bpb), parent_bpb, band)
+    n_parent = parent_n(parent_listed or {})
+    samples = [float(printed_bpb)]
+    if float(printed_bpb) < parent_bpb:
+        # 有苗头就追加测量：一次抽样的带宽既放得进幸运样本，
+        # 也挡得住比它小的真实改进。多抽几次两边都治。
+        measured = sample_scores(rows, head)
+        for index in range(2, int(config.get("trial_repeats", 3)) + 1):
+            seed = str(index)
+            if seed in measured:
+                samples.append(measured[seed])
+                continue
+            extra = blank_row()
+            extra.update({
+                "commit": head, "parent": parent_commit,
+                "mechanism": args.mechanism, "knobs": "",
+                "expect": args.expect, "fail": args.fail,
+                "seed": seed, "eval_hash": identity,
+            })
+            code = run_command(train, seed, repo / "run.log", timeout)
+            log_path = repo / "run.log"
+            text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+            got_seed, got_bpb = parse_summary(text)
+            if code != 0 or got_bpb is None:
+                extra["decision"] = "代码坏了"
+                append_result(results_path, extra)
+                break
+            if got_seed != seed:
+                extra["decision"] = "测量失败"
+                append_result(results_path, extra)
+                break
+            cut = short_run(text, task_py)
+            if cut is not None:
+                extra["decision"] = "测量失败"
+                extra["detail"] = f"只跑了 {cut[0]} 步，预算 {cut[1]} 步"
+                append_result(results_path, extra)
+                break
+            extra["val_bpb"] = got_bpb
+            extra["decision"] = "已记录"
+            append_result(results_path, extra)
+            samples.append(float(got_bpb))
+    mean = statistics.fmean(samples)
+    band = band_for(config["sigma"], config["z"], n_parent, len(samples))
+    row["decision"] = compare_to_parent(mean, parent_bpb, band)
+    if len(samples) > 1:
+        row["detail"] = f"{len(samples)} 次均值 {mean:.6f}"
     append_result(results_path, row)
     return 0
 
@@ -917,6 +974,7 @@ def cmd_calibrate(
         "min_improvement": min_improvement,
         "queue_limit": 2,
         "rotate_after": 8,
+        "trial_repeats": 3,
     })
     mean = statistics.fmean(scores)
     write_parents(repo / "parents.tsv", [{
@@ -955,11 +1013,13 @@ def cmd_accept(
             return refuse("--replace 只能指名这个提交自己的父本")
     elif seed1["decision"] != "好于父本":
         return refuse(f"判定是「{seed1['decision']}」，只有「好于父本」才能 accept")
+    measured = sample_scores(read_results(repo / "results.tsv"), head)
+    basis = statistics.fmean(measured.values()) if measured else float(seed1["val_bpb"])
     newcomer = {
         "commit": head,
         "mechanism": seed1["mechanism"],
-        "val_bpb": seed1["val_bpb"],
-        "seeds": "1",
+        "val_bpb": f"{basis:.6f}",
+        "seeds": ",".join(sorted(measured, key=int)) or "1",
         "reviewed": "no",
         "simpler": "yes" if simpler else "no",
     }
@@ -1046,11 +1106,18 @@ def cmd_claim(repo: Path, test_root: bool) -> int:
     result["detail"] = detail
     append_result(repo / "results.tsv", result)
     if decision in FINAL_CLAIMS:
-        candidate = [_bpb(slots[0]), _bpb(slots[1])]
-        mean = statistics.fmean([item for item in candidate if item is not None])
+        measured = sample_scores(read_results(repo / "results.tsv"), head)
+        if measured:
+            mean = statistics.fmean(measured.values())
+            seeds = ",".join(sorted(measured, key=int))
+        else:
+            mean = _bpb(slots[0]) or 0.0
+            seeds = "1,2"
         write_parents(
             repo / "parents.tsv",
-            apply_claim(read_parents(repo / "parents.tsv"), head, decision, mean),
+            apply_claim(
+                read_parents(repo / "parents.tsv"), head, decision, mean, seeds
+            ),
         )
         write_queue(repo / "queue.tsv", dequeue(read_queue(repo / "queue.tsv"), head))
     write_report(repo)
