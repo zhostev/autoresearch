@@ -154,6 +154,27 @@ def claim_verdict(
     return "没有更好", ""
 
 
+ATTEMPT_DECISIONS = frozenset({
+    "好于父本", "分不开", "差于父本", "代码坏了", "测量失败",
+})
+
+
+def rotation_blocked(
+    rows: list[dict], parent_count: int, head_parent: str, rotate_after: int
+) -> bool:
+    if parent_count < 2 or rotate_after < 1:
+        return False
+    attempts = [
+        row for row in rows
+        if row["seed"] == "1" and row["decision"] in ATTEMPT_DECISIONS
+    ]
+    window = attempts[-rotate_after:]
+    if len(window) < rotate_after:
+        return False
+    seen = {row["parent"] for row in window}
+    return len(seen) == 1 and head_parent in seen
+
+
 def _drop_one(rows: list[dict], newcomer_commit: str) -> dict:
     counts: dict[str, int] = {}
     for row in rows:
@@ -468,6 +489,11 @@ def main(
         if diff is None:
             return 2
         if touched_constants(diff) != parse_knobs(args.knobs):
+            return 2
+        if rotation_blocked(
+            rows, len(read_parents(repo / "parents.tsv")), parent,
+            config["rotate_after"],
+        ):
             return 2
     task_py, prepare_py, data_root = eval_paths(repo, root is not None)
     identity = eval_hash(task_py, prepare_py, data_root)

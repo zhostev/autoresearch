@@ -943,3 +943,42 @@ class TestKnobsRequiredOnSeed1(TestTrial):
         )
         self.assertEqual(code, 2)
         self.assertEqual(len(judge.read_results(self.root / "results.tsv")), 1)
+
+
+class TestRotation(unittest.TestCase):
+    def _rows(self, parents):
+        return [
+            {"seed": "1", "decision": "差于父本", "parent": parent}
+            for parent in parents
+        ]
+
+    def test_single_parent_never_blocks(self):
+        self.assertFalse(judge.rotation_blocked(self._rows(["p"] * 20), 1, "p", 8))
+
+    def test_eight_in_a_row_blocks_the_same_parent(self):
+        self.assertTrue(judge.rotation_blocked(self._rows(["p"] * 8), 3, "p", 8))
+
+    def test_a_different_parent_in_the_window_clears_it(self):
+        parents = ["p"] * 7 + ["q"]
+        self.assertFalse(judge.rotation_blocked(self._rows(parents), 3, "p", 8))
+        parents = ["q"] + ["p"] * 7
+        self.assertFalse(judge.rotation_blocked(self._rows(parents), 3, "p", 8))
+
+    def test_a_short_history_never_blocks(self):
+        self.assertFalse(judge.rotation_blocked(self._rows(["p"] * 7), 3, "p", 8))
+
+    def test_switching_to_another_parent_is_allowed(self):
+        self.assertFalse(judge.rotation_blocked(self._rows(["p"] * 8), 3, "q", 8))
+
+    def test_only_seed1_trial_rows_count(self):
+        rows = self._rows(["p"] * 8)
+        rows.insert(0, {"seed": "*", "decision": "进入名单", "parent": "q"})
+        rows.insert(0, {"seed": "2", "decision": "已记录", "parent": "q"})
+        self.assertTrue(judge.rotation_blocked(rows, 3, "p", 8))
+
+    def test_crashes_count_as_attempts(self):
+        parents = ["p"] * 8
+        rows = self._rows(parents)
+        rows[3]["decision"] = "代码坏了"
+        rows[4]["decision"] = "测量失败"
+        self.assertTrue(judge.rotation_blocked(rows, 3, "p", 8))
