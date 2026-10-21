@@ -3,21 +3,75 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
+import json
 import math
 import os
+import re
 import signal
 import statistics
 import subprocess
 import sys
 from pathlib import Path
 
-MIN_IMPROVEMENT: float | None = None
 TIMEOUT_SECONDS = 600
+
+RUN_FILE = "run.json"
+RUN_FIELDS: tuple[tuple[str, type], ...] = (
+    ("run_tag", str),
+    ("run_start", str),
+    ("baseline_commit", str),
+    ("eval_hash", str),
+    ("repeats", int),
+    ("z", float),
+    ("sigma", float),
+    ("min_improvement", float),
+    ("queue_limit", int),
+    ("rotate_after", int),
+)
+
+
+def read_run(repo: Path) -> dict | None:
+    path = repo / RUN_FILE
+    if not path.is_file():
+        return None
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    for name, kind in RUN_FIELDS:
+        if name not in config:
+            return None
+        value = config[name]
+        if kind is float and isinstance(value, int) and not isinstance(value, bool):
+            config[name] = float(value)
+            continue
+        if not isinstance(value, kind) or isinstance(value, bool):
+            return None
+    return config
+
+
+def write_run(repo: Path, config: dict) -> None:
+    path = repo / RUN_FILE
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def band_for(sigma: float, z: float, n: int) -> float:
+    count = n if n >= 1 else 1
+    return z * sigma * math.sqrt(1.0 + 1.0 / count)
 
 COUNTED_DECISIONS = frozenset({
     "好于父本",
-    "持平",
+    "分不开",
     "差于父本",
     "已记录",
     "代码坏了",
@@ -25,12 +79,19 @@ COUNTED_DECISIONS = frozenset({
 })
 
 
-def compare_seed1(candidate: float, parent: float) -> str:
-    if candidate < parent:
+def parent_n(parent_row: dict) -> int:
+    raw = parent_row.get("seeds", "")
+    parts = [item for item in raw.split(",") if item.strip() != ""]
+    return len(parts) if parts else 1
+
+
+def compare_to_parent(candidate: float, parent: float, band: float) -> str:
+    delta = candidate - parent
+    if delta < -band:
         return "好于父本"
-    if candidate == parent:
-        return "持平"
-    return "差于父本"
+    if delta > band:
+        return "差于父本"
+    return "分不开"
 
 
 def luck_penalty(candidate_a: float, candidate_b: float, n: int) -> float:
@@ -54,19 +115,10 @@ def claim_verdict(
     candidate_seed2: float | None,
     parent_seed1: float | None,
     parent_seed2: float | None,
-    prepare_hashes: list[str],
-    data_hashes: list[str],
+    eval_hashes: list[str],
     min_improvement: float | None,
     n: int,
 ) -> tuple[str, str]:
-    if (
-        len(prepare_hashes) != 4
-        or len(set(prepare_hashes)) != 1
-        or len(data_hashes) != 4
-        or len(set(data_hashes)) != 1
-        or any(item == "" for item in prepare_hashes + data_hashes)
-    ):
-        return "还判不了", "尺子或数据不同"
     missing = []
     if candidate_seed1 is None:
         missing.append("候选种子1")
@@ -78,8 +130,14 @@ def claim_verdict(
         missing.append("父本种子2")
     if missing:
         return "还判不了", "缺" + "、".join(missing)
+    if (
+        len(eval_hashes) != 4
+        or len(set(eval_hashes)) != 1
+        or any(item == "" for item in eval_hashes)
+    ):
+        return "还判不了", "尺子或数据不同"
     if min_improvement is None or min_improvement <= 0:
-        return "还判不了", "最小差距未写"
+        return "还判不了", "未标定"
     improvement_1 = parent_seed1 - candidate_seed1
     improvement_2 = parent_seed2 - candidate_seed2
     if improvement_1 == improvement_2 and improvement_1 != 0:
@@ -91,6 +149,53 @@ def claim_verdict(
     if average > min_improvement and average - penalty > min_improvement:
         return "成立", ""
     return "没有更好", ""
+
+
+ATTEMPT_DECISIONS = frozenset({
+    "好于父本", "分不开", "差于父本", "代码坏了", "测量失败",
+})
+
+
+def rotation_blocked(
+    rows: list[dict], parent_count: int, head_parent: str, rotate_after: int
+) -> bool:
+    if parent_count < 2 or rotate_after < 1:
+        return False
+    attempts = [
+        row for row in rows
+        if row["seed"] == "1" and row["decision"] in ATTEMPT_DECISIONS
+    ]
+    window = attempts[-rotate_after:]
+    if len(window) < rotate_after:
+        return False
+    seen = {row["parent"] for row in window}
+    return len(seen) == 1 and head_parent in seen
+
+
+FINAL_CLAIMS = frozenset({"成立", "更差", "没有更好"})
+
+
+def apply_claim(
+    parents: list[dict], commit: str, decision: str, mean: float
+) -> list[dict]:
+    if decision not in FINAL_CLAIMS:
+        return list(parents)
+    if not any(row["commit"] == commit for row in parents):
+        return list(parents)
+    if decision == "更差" and len(parents) > 1:
+        return [row for row in parents if row["commit"] != commit]
+    updated = []
+    for row in parents:
+        if row["commit"] != commit:
+            updated.append(row)
+            continue
+        fresh = dict(row)
+        fresh["reviewed"] = "yes"
+        if decision != "更差":
+            fresh["val_bpb"] = f"{mean:.6f}"
+            fresh["seeds"] = "1,2"
+        updated.append(fresh)
+    return updated
 
 
 def _drop_one(rows: list[dict], newcomer_commit: str) -> dict:
@@ -133,16 +238,63 @@ def apply_accept(
 
 
 RESULT_HEADER = (
-    "commit\tparent\tmechanism\texpect\tfail\tseed\tval_bpb\t"
-    "prepare_hash\tdata_hash\tdecision\tdetail"
+    "commit\tparent\tmechanism\tknobs\texpect\tfail\tseed\tval_bpb\t"
+    "eval_hash\tdecision\tdetail"
 )
-PARENT_HEADER = "commit\tmechanism\tval_bpb\tsimpler"
+PARENT_HEADER = "commit\tmechanism\tval_bpb\tseeds\treviewed\tsimpler"
 RESULT_FIELDS = RESULT_HEADER.split("\t")
 PARENT_FIELDS = PARENT_HEADER.split("\t")
 
 
 def _line(fields: list[str], row: dict) -> str:
     return "\t".join(row[field] for field in fields)
+
+
+QUEUE_HEADER = "commit\tparent\tmechanism\taccepted_at\tstate"
+QUEUE_FIELDS = QUEUE_HEADER.split("\t")
+
+
+def read_queue(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = []
+    for line in lines[1:]:
+        if line == "":
+            continue
+        rows.append(dict(zip(QUEUE_FIELDS, line.split("\t"))))
+    return rows
+
+
+def write_queue(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(QUEUE_HEADER + "\n")
+        for row in rows:
+            handle.write(_line(QUEUE_FIELDS, row) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def enqueue(rows: list[dict], entry: dict) -> list[dict]:
+    if any(row["commit"] == entry["commit"] for row in rows):
+        return list(rows)
+    return list(rows) + [entry]
+
+
+def dequeue(rows: list[dict], commit: str) -> list[dict]:
+    return [row for row in rows if row["commit"] != commit]
+
+
+def prune_queue(repo: Path, rows: list[dict]) -> list[dict]:
+    kept = []
+    for row in rows:
+        if git_output(repo, "cat-file", "-e", row["commit"] + "^{commit}") is None:
+            continue
+        kept.append(row)
+    return kept
 
 
 def read_results(path: Path) -> list[dict]:
@@ -154,6 +306,8 @@ def read_results(path: Path) -> list[dict]:
         if line == "":
             continue
         parts = line.split("\t")
+        if len(parts) < len(RESULT_FIELDS):
+            parts = parts + [""] * (len(RESULT_FIELDS) - len(parts))
         rows.append(dict(zip(RESULT_FIELDS, parts)))
     return rows
 
@@ -205,6 +359,105 @@ def record_accept(
         write_parents(parents_path, new_parents)
 
 
+def build_report(
+    config: dict | None,
+    rows: list[dict],
+    parents: list[dict],
+    queue: list[dict],
+) -> str:
+    out: list[str] = ["# 搜索报告", "", "## 标定", ""]
+    if config is None:
+        out.append("未标定。先运行 `uv run judge.py calibrate`。")
+    else:
+        out.append(f"- run_tag：{config['run_tag']}")
+        out.append(f"- run_start：{config['run_start']}")
+        out.append(f"- baseline：{config['baseline_commit'][:7]}")
+        out.append(f"- R = {config['repeats']}，Z = {config['z']}")
+        out.append(f"- σ = {config['sigma']:.6f}")
+        out.append(
+            f"- band（新父本）= {band_for(config['sigma'], config['z'], 1):.6f}"
+        )
+        out.append(f"- min_improvement = {config['min_improvement']:.6f}")
+        out.append(
+            f"- queue_limit = {config['queue_limit']}，"
+            f"rotate_after = {config['rotate_after']}"
+        )
+    out += ["", "## 轮次统计", ""]
+    groups: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if row["seed"] == "*":
+            continue
+        key = row["eval_hash"]
+        groups.setdefault(key, {})
+        groups[key][row["decision"]] = groups[key].get(row["decision"], 0) + 1
+    if not groups:
+        out.append("还没有记录。")
+    for key in sorted(groups):
+        out += [f"### 尺子 {key[:12]}", "", "| 判定 | 次数 |", "|---|---|"]
+        for decision in sorted(groups[key]):
+            out.append(f"| {decision} | {groups[key][decision]} |")
+        out.append("")
+    out += ["", "## 搜索结果（未验证）", ""]
+    if not parents:
+        out.append("名单为空。")
+    else:
+        out += ["| commit | 机制 | val_bpb | seeds | 已复核 |", "|---|---|---|---|---|"]
+        for row in parents:
+            out.append(
+                f"| {row['commit'][:7]} | {row['mechanism']} | {row['val_bpb']} "
+                f"| {row['seeds']} | {row['reviewed']} |"
+            )
+    out += ["", "## 已验证结论", ""]
+    holds = [row for row in rows if row["decision"] == "成立"]
+    if not holds:
+        out.append("无。进入名单不是已验证结论。")
+    else:
+        out += ["| commit | 机制 |", "|---|---|"]
+        for row in holds:
+            out.append(f"| {row['commit'][:7]} | {row['mechanism']} |")
+    out += ["", "## 未复核警告", ""]
+    if not queue:
+        out.append("队列为空。")
+    else:
+        out.append(f"还有 {len(queue)} 条待复核：")
+        for row in queue:
+            out.append(
+                f"- {row['commit'][:7]}（{row['mechanism']}，{row['accepted_at']}）"
+            )
+    out += ["", "## 机制审计", ""]
+    knobs_by_mechanism: dict[str, set[str]] = {}
+    for row in rows:
+        if row["seed"] not in {"1", "2"} or row["mechanism"] == "基线":
+            continue
+        knobs_by_mechanism.setdefault(row["mechanism"], set()).add(row["knobs"])
+    flagged = {
+        name: values for name, values in knobs_by_mechanism.items() if len(values) > 1
+    }
+    if not flagged:
+        out.append("同名机制的旋钮声明一致。")
+    else:
+        for name in sorted(flagged):
+            out.append(f"- {name}：{'、'.join(sorted(flagged[name]))}")
+    out.append("")
+    return "\n".join(out)
+
+
+def write_report(repo: Path) -> None:
+    text = build_report(
+        read_run(repo),
+        read_results(repo / "results.tsv"),
+        read_parents(repo / "parents.tsv"),
+        read_queue(repo / "queue.tsv"),
+    )
+    path = repo / "REPORT.md"
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
 def parse_summary(text: str) -> tuple[str | None, str | None]:
     seed = None
     val_bpb = None
@@ -224,33 +477,57 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def data_hash(tokenizer_path: Path, val_path: Path, data_dir: Path) -> str | None:
-    if not tokenizer_path.is_file() or not val_path.is_file() or not data_dir.is_dir():
+def data_manifest(data_root: Path) -> str | None:
+    if not data_root.is_dir():
         return None
-    lines = [
-        f"tokenizer.pkl {tokenizer_path.stat().st_size}",
-        f"shard_06542.parquet {val_path.stat().st_size}",
-    ]
-    for path in sorted(data_dir.glob("*.parquet")):
-        lines.append(f"{path.name} {path.stat().st_size}")
+    entries = []
+    for path in data_root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.name.startswith(".") or path.name.endswith(".tmp"):
+            continue
+        entries.append((path.relative_to(data_root).as_posix(), path.stat().st_size))
+    entries.sort(key=lambda item: item[0])
+    return "".join(f"{name} {size}\n" for name, size in entries)
+
+
+def eval_hash(task_py: Path, prepare_py: Path, data_root: Path) -> str | None:
+    if not task_py.is_file() or not prepare_py.is_file():
+        return None
+    manifest = data_manifest(data_root)
+    if manifest is None:
+        return None
+    payload = file_sha256(task_py) + "\n" + file_sha256(prepare_py) + "\n" + manifest
     digest = hashlib.sha256()
-    digest.update(("\n".join(lines) + "\n").encode("utf-8"))
+    digest.update(payload.encode("utf-8"))
     return digest.hexdigest()
 
 
-def trial_paths(root: Path) -> tuple[Path, Path, Path]:
-    data_dir = root / "data"
-    return root / "tokenizer.pkl", data_dir / "shard_06542.parquet", data_dir
+def refuse(reason: str) -> int:
+    print(f"拒绝：{reason}", file=sys.stderr)
+    return 2
 
 
-def production_paths() -> tuple[Path, Path, Path]:
-    from prepare import DATA_DIR, TOKENIZER_DIR, VAL_FILENAME
+COMPLETED_DECISIONS = frozenset({
+    "基线", "好于父本", "分不开", "差于父本", "已记录",
+})
 
-    return (
-        Path(TOKENIZER_DIR) / "tokenizer.pkl",
-        Path(DATA_DIR) / VAL_FILENAME,
-        Path(DATA_DIR),
-    )
+
+def ruler_moved(repo: Path, config: dict | None, test_root: bool) -> bool:
+    if config is None:
+        return True
+    task_py, prepare_py, data_root = eval_paths(repo, test_root)
+    return eval_hash(task_py, prepare_py, data_root) != config["eval_hash"]
+
+
+def eval_paths(repo: Path, test_root: bool) -> tuple[Path, Path, Path]:
+    task_py = repo / "task.py"
+    prepare_py = repo / "prepare.py"
+    if test_root:
+        return task_py, prepare_py, repo / "data"
+    from task import DATA_ROOT
+
+    return task_py, prepare_py, Path(DATA_ROOT)
 
 
 def git_output(root: Path, *args: str) -> str | None:
@@ -264,7 +541,8 @@ def git_output(root: Path, *args: str) -> str | None:
 
 def is_dirty(root: Path) -> bool:
     completed = subprocess.run(
-        ["git", "status", "--porcelain", "--", "train.py", "prepare.py", "judge.py"],
+        ["git", "status", "--porcelain", "--",
+         "train.py", "prepare.py", "judge.py", "task.py"],
         cwd=root, capture_output=True, text=True,
     )
     return completed.returncode != 0 or completed.stdout.strip() != ""
@@ -272,6 +550,28 @@ def is_dirty(root: Path) -> bool:
 
 def blank_row() -> dict:
     return {field: "" for field in RESULT_FIELDS}
+
+
+CONSTANT_LINE = re.compile(
+    r"^[+-]([A-Z][A-Z0-9_]*(?:[ \t]*,[ \t]*[A-Z][A-Z0-9_]*)*)"
+    r"[ \t]*(?::[^=]*)?(?:\*\*|//|>>|<<|[-+*/%@|&^])?=(?!=)"
+)
+
+
+def touched_constants(diff_text: str) -> set[str]:
+    found: set[str] = set()
+    for line in diff_text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        match = CONSTANT_LINE.match(line)
+        if match is not None:
+            for name in match.group(1).split(","):
+                found.add(name.strip())
+    return found
+
+
+def parse_knobs(raw: str) -> set[str]:
+    return {item.strip() for item in raw.split(",") if item.strip() != ""}
 
 
 def validate_text(seed: str, mechanism: str, expect: str, fail: str) -> str | None:
@@ -317,76 +617,130 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(prog="judge.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("baseline", "claim"):
+    for name in ("claim", "report"):
         sub.add_parser(name)
+    calibrate_parser = sub.add_parser("calibrate")
+    calibrate_parser.add_argument("--force", action="store_true")
     accept_parser = sub.add_parser("accept")
     accept_parser.add_argument("--simpler", action="store_true")
     accept_parser.add_argument("--replace", default=None)
     trial = sub.add_parser("trial")
     trial.add_argument("--seed", required=True)
     trial.add_argument("--mechanism", required=True)
+    trial.add_argument("--knobs", default=None)
     trial.add_argument("--expect", required=True)
     trial.add_argument("--fail", required=True)
     args = parser.parse_args(argv)
     repo = root or Path.cwd()
-    if args.cmd == "baseline":
-        return cmd_baseline(repo, command or ["uv", "run", "train.py"], TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds, root is not None)
+    if args.cmd == "report":
+        write_report(repo)
+        return 0
+    if args.cmd == "calibrate":
+        return cmd_calibrate(
+            repo,
+            command or ["uv", "run", "train.py"],
+            TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds,
+            root is not None,
+            args.force,
+        )
     if args.cmd == "accept":
-        return cmd_accept(repo, args.simpler, args.replace)
+        return cmd_accept(repo, args.simpler, args.replace, root is not None)
     if args.cmd == "claim":
-        return cmd_claim(repo)
+        return cmd_claim(repo, root is not None)
     if args.cmd != "trial":
-        return 2
+        return refuse("不认识这个子命令")
     timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     train = command or ["uv", "run", "train.py"]
     error = validate_text(args.seed, args.mechanism, args.expect, args.fail)
-    if error is not None or is_dirty(repo):
-        return 2
+    if error is not None:
+        return refuse(error)
+    if is_dirty(repo):
+        return refuse("工作区不干净：train.py / prepare.py / judge.py / task.py 有未提交改动")
+    config = read_run(repo)
+    if config is None:
+        return refuse("还没标定：先运行 judge.py calibrate")
+    if ruler_moved(repo, config, root is not None):
+        return refuse("尺子变了：task.py、prepare.py 或数据目录与 run.json 不一致，需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
     results_path = repo / "results.tsv"
     rows = read_results(results_path)
-    if any(row["commit"] == head and row["seed"] == args.seed for row in rows):
-        return 2
+    if any(
+        row["commit"] == head
+        and row["seed"] == args.seed
+        and row["decision"] in COMPLETED_DECISIONS
+        for row in rows
+    ):
+        return refuse("这个提交的该种子已经有完成记录了")
     if args.seed == "2":
         seed1 = [
             row for row in rows
             if row["commit"] == head and row["seed"] == "1"
-            and row["decision"] in {"基线", "好于父本", "持平", "差于父本"}
+            and row["decision"] in {"基线", "好于父本", "分不开", "差于父本"}
         ]
         if not seed1 or seed1[-1]["mechanism"] != args.mechanism:
-            return 2
+            return refuse("种子 2 要求这个提交已有同名机制的种子 1 完成记录")
     else:
         parent = git_output(repo, "rev-parse", "HEAD^")
         listed = {row["commit"] for row in read_parents(repo / "parents.tsv")}
         if parent is None or parent not in listed:
-            return 2
+            return refuse("这个提交的父本不在 parents.tsv 名单里")
         parent_scores = [
             item for item in rows
             if item["commit"] == parent and item["seed"] == "1" and item["val_bpb"] != ""
         ]
         if not parent_scores:
-            return 2
-    tokenizer, val, data_dir = trial_paths(repo) if root is not None else production_paths()
-    prepare_hash = file_sha256(repo / "prepare.py")
-    identity = data_hash(tokenizer, val, data_dir)
+            return refuse("父本还没有种子 1 的分数")
+        if args.knobs is None:
+            return refuse("种子 1 必须声明 --knobs（没改常量就写 --knobs \"\"）")
+        diff = git_output(repo, "diff", parent, head, "--", "train.py")
+        if diff is None:
+            return refuse("读不出 train.py 相对父本的 diff")
+        touched = touched_constants(diff)
+        declared = parse_knobs(args.knobs)
+        if touched != declared:
+            return refuse(
+                "声明的旋钮和 diff 对不上：diff 改了 "
+                f"{'、'.join(sorted(touched)) or '（无）'}，声明的是 "
+                f"{'、'.join(sorted(declared)) or '（无）'}"
+            )
+        if rotation_blocked(
+            rows, len(read_parents(repo / "parents.tsv")), parent,
+            config["rotate_after"],
+        ):
+            return refuse(
+                f"连续 {config['rotate_after']} 次都从这个父本出发了，换一个起点"
+            )
+        queue_path = repo / "queue.tsv"
+        queue_rows = read_queue(queue_path)
+        pruned = prune_queue(repo, queue_rows)
+        if pruned != queue_rows:
+            write_queue(queue_path, pruned)
+        if len(pruned) > config["queue_limit"]:
+            head_entry = pruned[0]
+            return refuse(
+                f"队列积压 {len(pruned)} 条，先复核 {head_entry['commit'][:7]}"
+                f"（{head_entry['mechanism']}）"
+            )
+    task_py, prepare_py, data_root = eval_paths(repo, root is not None)
+    identity = eval_hash(task_py, prepare_py, data_root)
     row = blank_row()
     row.update({
         "commit": head,
         "parent": git_output(repo, "rev-parse", "HEAD^") or "",
         "mechanism": args.mechanism,
+        "knobs": ",".join(sorted(parse_knobs(args.knobs or ""))) if args.seed == "1" else "",
         "expect": args.expect,
         "fail": args.fail,
         "seed": args.seed,
-        "prepare_hash": prepare_hash,
     })
     if identity is None:
         row["decision"] = "代码坏了"
         row["detail"] = "数据身份不可用"
         append_result(results_path, row)
         return 0
-    row["data_hash"] = identity
+    row["eval_hash"] = identity
     code = run_command(train, args.seed, repo / "run.log", timeout)
     log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
     printed_seed, printed_bpb = parse_summary(log_text)
@@ -408,8 +762,17 @@ def main(
         item for item in rows
         if item["commit"] == parent_commit and item["seed"] == "1" and item["val_bpb"] != ""
     ]
-    parent_bpb = float(parent_rows[-1]["val_bpb"])
-    row["decision"] = compare_seed1(float(printed_bpb), parent_bpb)
+    parent_listed = next(
+        (item for item in read_parents(repo / "parents.tsv")
+         if item["commit"] == parent_commit),
+        None,
+    )
+    parent_bpb = (
+        float(parent_listed["val_bpb"]) if parent_listed is not None
+        else float(parent_rows[-1]["val_bpb"])
+    )
+    band = band_for(config["sigma"], config["z"], parent_n(parent_listed or {}))
+    row["decision"] = compare_to_parent(float(printed_bpb), parent_bpb, band)
     append_result(results_path, row)
     return 0
 
@@ -425,87 +788,121 @@ def _bpb(row: dict | None) -> float | None:
     return float(row["val_bpb"])
 
 
-def cmd_baseline(repo: Path, command: list[str], timeout: float, test_root: bool) -> int:
+def calibration(scores: list[float], z: float) -> tuple[float, float]:
+    sigma = statistics.stdev(scores)
+    return sigma, z * sigma
+
+
+def cmd_calibrate(
+    repo: Path, command: list[str], timeout: float, test_root: bool,
+    force: bool = False,
+) -> int:
     if is_dirty(repo):
-        return 2
+        return refuse("工作区不干净")
+    if read_run(repo) is not None and not force:
+        return refuse(
+            "已经标定过了：重新标定会清空父本名单和复核队列，确认请加 --force"
+        )
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
+    task_py, prepare_py, data_root = eval_paths(repo, test_root)
+    identity = eval_hash(task_py, prepare_py, data_root)
     results_path = repo / "results.tsv"
-    rows = read_results(results_path)
-    existing = [
-        row for row in rows
-        if row["commit"] == head and row["seed"] == "1" and row["decision"] == "基线"
-    ]
-    if existing and not read_parents(repo / "parents.tsv"):
-        write_parents(repo / "parents.tsv", [{
-            "commit": head,
-            "mechanism": "基线",
-            "val_bpb": existing[-1]["val_bpb"],
-            "simpler": "no",
-        }])
-        return 0
-    if existing:
-        return 2
-    tokenizer, val, data_dir = trial_paths(repo) if test_root else production_paths()
-    row = blank_row()
-    row.update({
-        "commit": head,
-        "parent": "",
-        "mechanism": "基线",
-        "expect": "lower",
-        "fail": "基线",
-        "seed": "1",
-        "prepare_hash": file_sha256(repo / "prepare.py"),
-    })
-    identity = data_hash(tokenizer, val, data_dir)
     if identity is None:
-        row["decision"] = "代码坏了"
-        row["detail"] = "数据身份不可用"
+        row = blank_row()
+        row.update({
+            "commit": head, "mechanism": "基线", "expect": "lower",
+            "fail": "基线", "seed": "1", "decision": "代码坏了",
+            "detail": "数据身份不可用",
+        })
         append_result(results_path, row)
-        return 0
-    row["data_hash"] = identity
-    code = run_command(command, "1", repo / "run.log", timeout)
-    log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
-    printed_seed, printed_bpb = parse_summary(log_text)
-    if code != 0 or printed_bpb is None:
-        row["decision"] = "代码坏了"
+        return refuse("数据身份不可用：task.DATA_ROOT 不存在")
+    repeats = 5
+    z = 2.0
+    scores: list[float] = []
+    for index in range(repeats):
+        seed = str(index + 1)
+        row = blank_row()
+        row.update({
+            "commit": head, "mechanism": "基线", "expect": "lower",
+            "fail": "基线", "seed": seed, "eval_hash": identity,
+        })
+        code = run_command(command, seed, repo / "run.log", timeout)
+        log_path = repo / "run.log"
+        log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        printed_seed, printed_bpb = parse_summary(log_text)
+        if code != 0 or printed_bpb is None:
+            row["decision"] = "代码坏了"
+            append_result(results_path, row)
+            return refuse(f"标定第 {seed} 次训练崩了，整次标定作废")
+        if printed_seed != seed:
+            row["decision"] = "测量失败"
+            append_result(results_path, row)
+            return refuse(f"标定第 {seed} 次打印的种子不是 {seed}，整次标定作废")
+        row["val_bpb"] = printed_bpb
+        row["decision"] = "基线"
         append_result(results_path, row)
-        return 0
-    if printed_seed != "1":
-        row["decision"] = "测量失败"
-        append_result(results_path, row)
-        return 0
-    row["val_bpb"] = printed_bpb
-    row["decision"] = "基线"
-    append_result(results_path, row)
+        scores.append(float(printed_bpb))
+    sigma, min_improvement = calibration(scores, z)
+    if sigma <= 0.0:
+        return refuse("五次基线分数完全相同，测不出噪声；这个任务的判定会退化成精确比较")
+    tag = git_output(repo, "rev-parse", "--abbrev-ref", "HEAD") or ""
+    write_run(repo, {
+        "run_tag": tag.rsplit("/", 1)[-1],
+        "run_start": datetime.datetime.now().astimezone().isoformat(),
+        "baseline_commit": head,
+        "eval_hash": identity,
+        "repeats": repeats,
+        "z": z,
+        "sigma": sigma,
+        "min_improvement": min_improvement,
+        "queue_limit": 2,
+        "rotate_after": 8,
+    })
+    mean = statistics.fmean(scores)
     write_parents(repo / "parents.tsv", [{
         "commit": head,
         "mechanism": "基线",
-        "val_bpb": printed_bpb,
+        "val_bpb": f"{mean:.6f}",
+        "seeds": ",".join(str(index + 1) for index in range(repeats)),
+        "reviewed": "yes",
         "simpler": "no",
     }])
+    write_queue(repo / "queue.tsv", [])
+    write_report(repo)
     return 0
 
 
-def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
+def cmd_accept(
+    repo: Path, simpler: bool, replace_commit: str | None, test_root: bool
+) -> int:
     if is_dirty(repo):
-        return 2
+        return refuse("工作区不干净")
+    config = read_run(repo)
+    if config is None:
+        return refuse("还没标定：先运行 judge.py calibrate")
+    if ruler_moved(repo, config, test_root):
+        return refuse("尺子变了：需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
     seed1 = _latest(read_results(repo / "results.tsv"), head, "1")
     if seed1 is None:
-        return 2
+        return refuse("这个提交没有种子 1 记录，不能 accept")
     if simpler:
-        if seed1["decision"] != "持平" or not replace_commit:
-            return 2
+        if seed1["decision"] != "分不开" or not replace_commit:
+            return refuse("--simpler 只接受判定为「分不开」且指定了 --replace 的提交")
+        if replace_commit != seed1["parent"]:
+            return refuse("--replace 只能指名这个提交自己的父本")
     elif seed1["decision"] != "好于父本":
-        return 2
+        return refuse(f"判定是「{seed1['decision']}」，只有「好于父本」才能 accept")
     newcomer = {
         "commit": head,
         "mechanism": seed1["mechanism"],
         "val_bpb": seed1["val_bpb"],
+        "seeds": "1",
+        "reviewed": "no",
         "simpler": "yes" if simpler else "no",
     }
     try:
@@ -515,7 +912,7 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
             replace_commit if simpler else None,
         )
     except ValueError:
-        return 2
+        return refuse("--replace 指定的提交不在名单里")
     result = blank_row()
     result.update({
         "commit": head,
@@ -524,8 +921,8 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
         "expect": seed1["expect"],
         "fail": seed1["fail"],
         "seed": "*",
-        "prepare_hash": seed1["prepare_hash"],
-        "data_hash": seed1["data_hash"],
+        "knobs": seed1["knobs"],
+        "eval_hash": seed1["eval_hash"],
         "decision": decision,
         "detail": detail,
     })
@@ -535,15 +932,29 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
         result,
         None if decision == "未留下" else parents,
     )
+    if decision != "未留下":
+        write_queue(repo / "queue.tsv", enqueue(read_queue(repo / "queue.tsv"), {
+            "commit": head,
+            "parent": seed1["parent"],
+            "mechanism": seed1["mechanism"],
+            "accepted_at": datetime.datetime.now().astimezone().isoformat(),
+            "state": "待复核",
+        }))
+    write_report(repo)
     return 0
 
 
-def cmd_claim(repo: Path) -> int:
+def cmd_claim(repo: Path, test_root: bool) -> int:
     if is_dirty(repo):
-        return 2
+        return refuse("工作区不干净")
+    config = read_run(repo)
+    if config is None:
+        return refuse("还没标定：先运行 judge.py calibrate")
+    if ruler_moved(repo, config, test_root):
+        return refuse("尺子变了：需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
-        return 2
+        return refuse("读不出 HEAD")
     parent = git_output(repo, "rev-parse", "HEAD^")
     rows = read_results(repo / "results.tsv")
     result = blank_row()
@@ -569,14 +980,22 @@ def cmd_claim(repo: Path) -> int:
         _bpb(slots[1]),
         _bpb(slots[2]),
         _bpb(slots[3]),
-        [row["prepare_hash"] if row else "" for row in slots],
-        [row["data_hash"] if row else "" for row in slots],
-        MIN_IMPROVEMENT,
+        [row["eval_hash"] if row else "" for row in slots],
+        config["min_improvement"],
         count_n(rows),
     )
     result["decision"] = decision
     result["detail"] = detail
     append_result(repo / "results.tsv", result)
+    if decision in FINAL_CLAIMS:
+        candidate = [_bpb(slots[0]), _bpb(slots[1])]
+        mean = statistics.fmean([item for item in candidate if item is not None])
+        write_parents(
+            repo / "parents.tsv",
+            apply_claim(read_parents(repo / "parents.tsv"), head, decision, mean),
+        )
+        write_queue(repo / "queue.tsv", dequeue(read_queue(repo / "queue.tsv"), head))
+    write_report(repo)
     return 0
 
 

@@ -23,3 +23,6 @@ dev/
 results.tsv
 parents.tsv
 run.log
+run.json
+queue.tsv
+REPORT.md
