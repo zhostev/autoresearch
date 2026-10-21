@@ -119,12 +119,6 @@ def claim_verdict(
     min_improvement: float | None,
     n: int,
 ) -> tuple[str, str]:
-    if (
-        len(eval_hashes) != 4
-        or len(set(eval_hashes)) != 1
-        or any(item == "" for item in eval_hashes)
-    ):
-        return "还判不了", "尺子或数据不同"
     missing = []
     if candidate_seed1 is None:
         missing.append("候选种子1")
@@ -136,6 +130,12 @@ def claim_verdict(
         missing.append("父本种子2")
     if missing:
         return "还判不了", "缺" + "、".join(missing)
+    if (
+        len(eval_hashes) != 4
+        or len(set(eval_hashes)) != 1
+        or any(item == "" for item in eval_hashes)
+    ):
+        return "还判不了", "尺子或数据不同"
     if min_improvement is None or min_improvement <= 0:
         return "还判不了", "未标定"
     improvement_1 = parent_seed1 - candidate_seed1
@@ -497,6 +497,23 @@ def eval_hash(task_py: Path, prepare_py: Path, data_root: Path) -> str | None:
     return digest.hexdigest()
 
 
+def refuse(reason: str) -> int:
+    print(f"拒绝：{reason}", file=sys.stderr)
+    return 2
+
+
+COMPLETED_DECISIONS = frozenset({
+    "基线", "好于父本", "分不开", "差于父本", "已记录",
+})
+
+
+def ruler_moved(repo: Path, config: dict | None, test_root: bool) -> bool:
+    if config is None:
+        return True
+    task_py, prepare_py, data_root = eval_paths(repo, test_root)
+    return eval_hash(task_py, prepare_py, data_root) != config["eval_hash"]
+
+
 def eval_paths(repo: Path, test_root: bool) -> tuple[Path, Path, Path]:
     task_py = repo / "task.py"
     prepare_py = repo / "prepare.py"
@@ -614,9 +631,9 @@ def main(
             root is not None,
         )
     if args.cmd == "accept":
-        return cmd_accept(repo, args.simpler, args.replace)
+        return cmd_accept(repo, args.simpler, args.replace, root is not None)
     if args.cmd == "claim":
-        return cmd_claim(repo)
+        return cmd_claim(repo, root is not None)
     if args.cmd != "trial":
         return 2
     timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
@@ -626,14 +643,21 @@ def main(
         return 2
     config = read_run(repo)
     if config is None:
-        return 2
+        return refuse("还没标定：先运行 judge.py calibrate")
+    if ruler_moved(repo, config, root is not None):
+        return refuse("尺子变了：task.py、prepare.py 或数据目录与 run.json 不一致，需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
         return 2
     results_path = repo / "results.tsv"
     rows = read_results(results_path)
-    if any(row["commit"] == head and row["seed"] == args.seed for row in rows):
-        return 2
+    if any(
+        row["commit"] == head
+        and row["seed"] == args.seed
+        and row["decision"] in COMPLETED_DECISIONS
+        for row in rows
+    ):
+        return refuse("这个提交的该种子已经有完成记录了")
     if args.seed == "2":
         seed1 = [
             row for row in rows
@@ -823,9 +847,16 @@ def cmd_calibrate(
     return 0
 
 
-def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
+def cmd_accept(
+    repo: Path, simpler: bool, replace_commit: str | None, test_root: bool
+) -> int:
     if is_dirty(repo):
-        return 2
+        return refuse("工作区不干净")
+    config = read_run(repo)
+    if config is None:
+        return refuse("还没标定：先运行 judge.py calibrate")
+    if ruler_moved(repo, config, test_root):
+        return refuse("尺子变了：需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
         return 2
@@ -834,7 +865,9 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
         return 2
     if simpler:
         if seed1["decision"] != "分不开" or not replace_commit:
-            return 2
+            return refuse("--simpler 只接受判定为「分不开」且指定了 --replace 的提交")
+        if replace_commit != seed1["parent"]:
+            return refuse("--replace 只能指名这个提交自己的父本")
     elif seed1["decision"] != "好于父本":
         return 2
     newcomer = {
@@ -884,9 +917,14 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
     return 0
 
 
-def cmd_claim(repo: Path) -> int:
+def cmd_claim(repo: Path, test_root: bool) -> int:
     if is_dirty(repo):
-        return 2
+        return refuse("工作区不干净")
+    config = read_run(repo)
+    if config is None:
+        return refuse("还没标定：先运行 judge.py calibrate")
+    if ruler_moved(repo, config, test_root):
+        return refuse("尺子变了：需重新 calibrate")
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
         return 2
@@ -916,7 +954,7 @@ def cmd_claim(repo: Path) -> int:
         _bpb(slots[2]),
         _bpb(slots[3]),
         [row["eval_hash"] if row else "" for row in slots],
-        (read_run(repo) or {}).get("min_improvement"),
+        config["min_improvement"],
         count_n(rows),
     )
     result["decision"] = decision

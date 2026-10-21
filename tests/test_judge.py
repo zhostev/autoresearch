@@ -532,6 +532,7 @@ class TestCommands(TestTrial):
         self.assertEqual((self.root / "parents.tsv").read_text(encoding="utf-8"), before)
 
     def test_claim_empty_score_names_the_gap(self):
+        self._write_run()
         head = git_head(self.root)
         self._git("commit", "--allow-empty", "-m", "child")
         child = git_head(self.root)
@@ -544,8 +545,6 @@ class TestCommands(TestTrial):
             row = self._done_row("学习率", seed, "已记录", val)
             row["commit"] = commit
             row["parent"] = head if commit == child else ""
-            row["prepare_hash"] = "p"
-            row["data_hash"] = "d"
             if seed == "1" and commit == head:
                 row["decision"] = "基线"
             judge.append_result(self.root / "results.tsv", row)
@@ -1366,3 +1365,146 @@ class TestSeed2OnATie(TestTrial):
         self.assertEqual(
             judge.read_results(self.root / "results.tsv")[-1]["decision"], "已记录"
         )
+
+
+class TestEvalHashGate(TestTrial):
+    def _move_the_ruler(self):
+        (self.root / "data" / "extra.parquet").write_bytes(b"x")
+
+    def test_trial_is_refused_when_the_ruler_moved(self):
+        self._prepare_child()
+        before = len(judge.read_results(self.root / "results.tsv"))
+        self._move_the_ruler()
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.500000"),
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), before)
+
+    def test_seed2_is_refused_when_the_ruler_moved(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        seed1 = self._done_row("学习率", "1", "好于父本", "0.900000")
+        seed1["commit"] = head
+        seed1["parent"] = parent
+        judge.append_result(self.root / "results.tsv", seed1)
+        self._move_the_ruler()
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "学习率",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.910000"),
+        )
+        self.assertEqual(code, 2)
+
+    def test_accept_is_refused_when_the_ruler_moved(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        better = self._done_row("学习率", "1", "好于父本", "0.500000")
+        better["commit"] = head
+        better["parent"] = parent
+        judge.append_result(self.root / "results.tsv", better)
+        self._move_the_ruler()
+        self.assertEqual(judge.main(["accept"], root=self.root), 2)
+        self.assertEqual(
+            [row["commit"] for row in judge.read_parents(self.root / "parents.tsv")],
+            [parent],
+        )
+
+    def test_claim_is_refused_when_the_ruler_moved(self):
+        self._prepare_child()
+        self._move_the_ruler()
+        self.assertEqual(judge.main(["claim"], root=self.root), 2)
+
+    def test_report_still_works_when_the_ruler_moved(self):
+        self._prepare_child()
+        self._move_the_ruler()
+        self.assertEqual(judge.main(["report"], root=self.root), 0)
+        self.assertTrue((self.root / "REPORT.md").is_file())
+
+
+class TestReviewRetry(TestTrial):
+    def _accepted_head(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        seed1 = self._done_row("学习率", "1", "好于父本", "0.900000")
+        seed1["commit"] = head
+        seed1["parent"] = parent
+        judge.append_result(self.root / "results.tsv", seed1)
+        return parent, head
+
+    def test_a_crashed_seed2_can_be_retried(self):
+        parent, head = self._accepted_head()
+        crash = self._done_row("学习率", "2", "代码坏了", "")
+        crash["commit"] = head
+        judge.append_result(self.root / "results.tsv", crash)
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "学习率",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.910000"),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            judge.read_results(self.root / "results.tsv")[-1]["decision"], "已记录"
+        )
+
+    def test_a_completed_seed2_still_cannot_be_repeated(self):
+        parent, head = self._accepted_head()
+        done = self._done_row("学习率", "2", "已记录", "0.910000")
+        done["commit"] = head
+        judge.append_result(self.root / "results.tsv", done)
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "学习率",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.920000"),
+        )
+        self.assertEqual(code, 2)
+
+
+class TestReplaceMustNameTheOwnParent(TestTrial):
+    def test_a_tie_cannot_evict_an_unrelated_parent(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        other = "f" * 40
+        judge.write_parents(self.root / "parents.tsv", [
+            {"commit": parent, "mechanism": "基线", "val_bpb": "1.000000",
+             "seeds": "1,2,3,4,5", "reviewed": "yes", "simpler": "no"},
+            {"commit": other, "mechanism": "冠军", "val_bpb": "0.100000",
+             "seeds": "1,2", "reviewed": "yes", "simpler": "no"},
+        ])
+        tie = self._done_row("学习率", "1", "分不开", "1.000000")
+        tie["commit"] = head
+        tie["parent"] = parent
+        judge.append_result(self.root / "results.tsv", tie)
+        code = judge.main(["accept", "--simpler", "--replace", other], root=self.root)
+        self.assertEqual(code, 2)
+        self.assertIn(
+            other,
+            [row["commit"] for row in judge.read_parents(self.root / "parents.tsv")],
+        )
+
+    def test_replacing_its_own_parent_is_allowed(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        tie = self._done_row("学习率", "1", "分不开", "1.000000")
+        tie["commit"] = head
+        tie["parent"] = parent
+        judge.append_result(self.root / "results.tsv", tie)
+        self.assertEqual(
+            judge.main(["accept", "--simpler", "--replace", parent], root=self.root), 0
+        )
+
+
+class TestMissingScoreBeatsHashAlarm(unittest.TestCase):
+    def test_an_absent_row_is_a_missing_score_not_a_moved_ruler(self):
+        decision, detail = judge.claim_verdict(
+            0.9, 0.9, 1.0, None, ["e", "e", "e", ""], 0.001, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "缺父本种子2"))
+
+    def test_four_present_but_unequal_hashes_still_alarm(self):
+        decision, detail = judge.claim_verdict(
+            0.9, 0.9, 1.0, 1.0, ["e", "f", "e", "e"], 0.001, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
