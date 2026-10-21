@@ -14,7 +14,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-MIN_IMPROVEMENT: float | None = None
 TIMEOUT_SECONDS = 600
 
 RUN_FILE = "run.json"
@@ -71,7 +70,7 @@ def band_for(sigma: float, z: float, n: int) -> float:
 
 COUNTED_DECISIONS = frozenset({
     "好于父本",
-    "持平",
+    "分不开",
     "差于父本",
     "已记录",
     "代码坏了",
@@ -79,12 +78,19 @@ COUNTED_DECISIONS = frozenset({
 })
 
 
-def compare_seed1(candidate: float, parent: float) -> str:
-    if candidate < parent:
+def parent_n(parent_row: dict) -> int:
+    raw = parent_row.get("seeds", "")
+    parts = [item for item in raw.split(",") if item.strip() != ""]
+    return len(parts) if parts else 1
+
+
+def compare_to_parent(candidate: float, parent: float, band: float) -> str:
+    delta = candidate - parent
+    if delta < -band:
         return "好于父本"
-    if candidate == parent:
-        return "持平"
-    return "差于父本"
+    if delta > band:
+        return "差于父本"
+    return "分不开"
 
 
 def luck_penalty(candidate_a: float, candidate_b: float, n: int) -> float:
@@ -407,6 +413,9 @@ def main(
     error = validate_text(args.seed, args.mechanism, args.expect, args.fail)
     if error is not None or is_dirty(repo):
         return 2
+    config = read_run(repo)
+    if config is None:
+        return 2
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
         return 2
@@ -471,8 +480,17 @@ def main(
         item for item in rows
         if item["commit"] == parent_commit and item["seed"] == "1" and item["val_bpb"] != ""
     ]
-    parent_bpb = float(parent_rows[-1]["val_bpb"])
-    row["decision"] = compare_seed1(float(printed_bpb), parent_bpb)
+    parent_listed = next(
+        (item for item in read_parents(repo / "parents.tsv")
+         if item["commit"] == parent_commit),
+        None,
+    )
+    parent_bpb = (
+        float(parent_listed["val_bpb"]) if parent_listed is not None
+        else float(parent_rows[-1]["val_bpb"])
+    )
+    band = band_for(config["sigma"], config["z"], parent_n(parent_listed or {}))
+    row["decision"] = compare_to_parent(float(printed_bpb), parent_bpb, band)
     append_result(results_path, row)
     return 0
 
@@ -577,7 +595,7 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
     if seed1 is None:
         return 2
     if simpler:
-        if seed1["decision"] != "持平" or not replace_commit:
+        if seed1["decision"] != "分不开" or not replace_commit:
             return 2
     elif seed1["decision"] != "好于父本":
         return 2
@@ -652,7 +670,7 @@ def cmd_claim(repo: Path) -> int:
         _bpb(slots[3]),
         [row["eval_hash"] if row else "" for row in slots],
         [row["eval_hash"] if row else "" for row in slots],
-        MIN_IMPROVEMENT,
+        (read_run(repo) or {}).get("min_improvement"),
         count_n(rows),
     )
     result["decision"] = decision

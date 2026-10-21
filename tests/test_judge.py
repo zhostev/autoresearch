@@ -9,13 +9,14 @@ import judge
 
 class TestClaim(unittest.TestCase):
     def test_seed1_directions(self):
-        self.assertEqual(judge.compare_seed1(0.9, 1.0), "好于父本")
-        self.assertEqual(judge.compare_seed1(1.0, 1.0), "持平")
-        self.assertEqual(judge.compare_seed1(1.1, 1.0), "差于父本")
+        self.assertEqual(judge.compare_to_parent(0.9, 1.0, 0.0), "好于父本")
+        self.assertEqual(judge.compare_to_parent(1.0, 1.0, 0.0), "分不开")
+        self.assertEqual(judge.compare_to_parent(1.1, 1.0, 0.0), "差于父本")
+        self.assertFalse(hasattr(judge, "compare_seed1"))
 
     def test_timeout_constant(self):
         self.assertEqual(judge.TIMEOUT_SECONDS, 600)
-        self.assertIsNone(judge.MIN_IMPROVEMENT)
+        self.assertFalse(hasattr(judge, "MIN_IMPROVEMENT"))
 
     def test_missing_inputs_have_distinct_details(self):
         hashes = ["a", "a", "a", "a"]
@@ -310,8 +311,26 @@ class TestTrial(unittest.TestCase):
             "detail": "",
         }
 
-    def _prepare_child(self):
+    def _write_run(self, sigma=0.004, **overrides):
+        config = {
+            "run_tag": "test",
+            "run_start": "2026-10-21T00:00:00+08:00",
+            "baseline_commit": git_head(self.root),
+            "eval_hash": self._identity(),
+            "repeats": 5,
+            "z": 2.0,
+            "sigma": sigma,
+            "min_improvement": 2.0 * sigma,
+            "queue_limit": 2,
+            "rotate_after": 8,
+        }
+        config.update(overrides)
+        judge.write_run(self.root, config)
+        return config
+
+    def _prepare_child(self, sigma=0.004):
         parent = git_head(self.root)
+        self._write_run(sigma)
         judge.write_parents(self.root / "parents.tsv", [{
             "commit": parent,
             "mechanism": "基线",
@@ -353,6 +372,7 @@ class TestTrial(unittest.TestCase):
     def test_seed2_baseline_mechanism_records_score(self):
         import sys
 
+        self._write_run()
         judge.append_result(
             self.root / "results.tsv",
             self._done_row("基线", "1", "基线", "1.000000"),
@@ -805,3 +825,32 @@ class TestCalibrate(TestTrial):
     def test_baseline_subcommand_is_gone(self):
         with self.assertRaises(SystemExit):
             judge.main(["baseline"], command=["true"], timeout_seconds=1, root=self.root)
+
+
+class TestNoiseBand(unittest.TestCase):
+    def test_band_edges_are_indistinguishable(self):
+        band = judge.band_for(0.004, 2.0, 1)
+        self.assertEqual(judge.compare_to_parent(1.0 - band - 1e-9, 1.0, band), "好于父本")
+        self.assertEqual(judge.compare_to_parent(1.0 - band, 1.0, band), "分不开")
+        self.assertEqual(judge.compare_to_parent(1.0, 1.0, band), "分不开")
+        self.assertEqual(judge.compare_to_parent(1.0 + band, 1.0, band), "分不开")
+        self.assertEqual(judge.compare_to_parent(1.0 + band + 1e-9, 1.0, band), "差于父本")
+
+    def test_flower14_champion_is_indistinguishable(self):
+        band = judge.band_for(0.0005, 2.0, 1)
+        self.assertEqual(judge.compare_to_parent(0.048064, 0.049399, band), "分不开")
+
+    def test_a_real_gain_still_wins(self):
+        band = judge.band_for(0.0005, 2.0, 1)
+        self.assertEqual(judge.compare_to_parent(0.048064, 0.132844, band), "好于父本")
+
+    def test_parent_n_counts_the_seed_list(self):
+        self.assertEqual(judge.parent_n({"seeds": "1"}), 1)
+        self.assertEqual(judge.parent_n({"seeds": "1,2"}), 2)
+        self.assertEqual(judge.parent_n({"seeds": "1,2,3,4,5"}), 5)
+
+    def test_parent_n_falls_back_to_one_on_bad_input(self):
+        self.assertEqual(judge.parent_n({"seeds": ""}), 1)
+        self.assertEqual(judge.parent_n({"seeds": "   "}), 1)
+        self.assertEqual(judge.parent_n({}), 1)
+        self.assertEqual(judge.parent_n({"seeds": ",,"}), 1)
