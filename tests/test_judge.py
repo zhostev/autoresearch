@@ -1186,3 +1186,136 @@ class TestClaimSideEffects(unittest.TestCase):
     def test_not_yet_decidable_changes_nothing(self):
         before = self._parents()
         self.assertEqual(judge.apply_claim(before, "b" * 40, "还判不了", 0.9), before)
+
+
+class TestReport(unittest.TestCase):
+    def _config(self):
+        return {
+            "run_tag": "mar5", "run_start": "2026-10-21T15:22:00+08:00",
+            "baseline_commit": "a" * 40, "eval_hash": "e" * 64,
+            "repeats": 5, "z": 2.0, "sigma": 0.004,
+            "min_improvement": 0.008, "queue_limit": 2, "rotate_after": 8,
+        }
+
+    def _row(self, commit, decision, eval_hash="e" * 64, mechanism="学习率", knobs=""):
+        return {
+            "commit": commit, "parent": "a" * 40, "mechanism": mechanism,
+            "knobs": knobs, "expect": "lower", "fail": "崩了", "seed": "1",
+            "val_bpb": "0.900000", "eval_hash": eval_hash,
+            "decision": decision, "detail": "",
+        }
+
+    def test_calibration_numbers_appear(self):
+        text = judge.build_report(self._config(), [], [], [])
+        self.assertIn("0.004", text)
+        self.assertIn("0.008", text)
+
+    def test_two_eval_hashes_split_the_table(self):
+        rows = [
+            self._row("b" * 40, "好于父本", "e" * 64),
+            self._row("c" * 40, "差于父本", "f" * 64),
+        ]
+        text = judge.build_report(self._config(), rows, [], [])
+        self.assertIn("e" * 12, text)
+        self.assertIn("f" * 12, text)
+
+    def test_no_holds_says_none(self):
+        rows = [self._row("b" * 40, "好于父本")]
+        text = judge.build_report(self._config(), rows, [], [])
+        self.assertIn("## 已验证结论", text)
+        section = text.split("## 已验证结论", 1)[1].split("##", 1)[0]
+        self.assertIn("无", section)
+
+    def test_listed_commit_without_a_hold_stays_unverified(self):
+        parents = [{
+            "commit": "b" * 40, "mechanism": "学习率", "val_bpb": "0.900000",
+            "seeds": "1", "reviewed": "no", "simpler": "no",
+        }]
+        rows = [self._row("b" * 40, "进入名单")]
+        text = judge.build_report(self._config(), rows, parents, [])
+        unverified = text.split("## 搜索结果（未验证）", 1)[1].split("##", 1)[0]
+        verified = text.split("## 已验证结论", 1)[1].split("##", 1)[0]
+        self.assertIn("b" * 7, unverified)
+        self.assertNotIn("b" * 7, verified)
+
+    def test_a_hold_is_listed_as_verified(self):
+        rows = [self._row("b" * 40, "成立")]
+        text = judge.build_report(self._config(), rows, [], [])
+        verified = text.split("## 已验证结论", 1)[1].split("##", 1)[0]
+        self.assertIn("b" * 7, verified)
+
+    def test_queue_backlog_is_warned(self):
+        queue = [{
+            "commit": "b" * 40, "parent": "a" * 40, "mechanism": "学习率",
+            "accepted_at": "2026-10-21T16:00:00+08:00", "state": "待复核",
+        }]
+        text = judge.build_report(self._config(), [], [], queue)
+        self.assertIn("待复核", text)
+        self.assertIn("b" * 7, text)
+
+    def test_inconsistent_knobs_are_audited(self):
+        rows = [
+            self._row("b" * 40, "差于父本", mechanism="分辨率", knobs="IMAGE_SIZE"),
+            self._row("c" * 40, "差于父本", mechanism="分辨率", knobs="BATCH_SIZE"),
+        ]
+        text = judge.build_report(self._config(), rows, [], [])
+        audit = text.split("## 机制审计", 1)[1]
+        self.assertIn("分辨率", audit)
+
+    def test_consistent_knobs_are_not_audited(self):
+        rows = [
+            self._row("b" * 40, "差于父本", mechanism="分辨率", knobs="IMAGE_SIZE"),
+            self._row("c" * 40, "差于父本", mechanism="分辨率", knobs="IMAGE_SIZE"),
+        ]
+        text = judge.build_report(self._config(), rows, [], [])
+        audit = text.split("## 机制审计", 1)[1]
+        self.assertNotIn("分辨率", audit)
+
+    def test_uncalibrated_report_still_renders(self):
+        self.assertIn("未标定", judge.build_report(None, [], [], []))
+
+
+class TestReportIsWritten(TestTrial):
+    def _report(self):
+        path = self.root / "REPORT.md"
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+
+    def test_report_subcommand_writes_the_file(self):
+        self.assertEqual(judge.main(["report"], root=self.root), 0)
+        self.assertIn("未标定", self._report())
+
+    def test_calibrate_writes_the_report(self):
+        values = ["1.000000", "1.004000", "0.996000", "1.002000", "0.998000"]
+        table = ", ".join(
+            f"'{index + 1}': '{value}'" for index, value in enumerate(values)
+        )
+        script = self.root / "fake_train.py"
+        script.write_text(
+            "import os\n"
+            f"table = {{{table}}}\n"
+            "seed = os.environ['AUTORES_SEED']\n"
+            "print('seed: ' + seed)\n"
+            "print('val_bpb:          ' + table[seed])\n",
+            encoding="utf-8",
+        )
+        judge.main(
+            ["calibrate"],
+            command=[sys.executable, str(script)],
+            timeout_seconds=5,
+            root=self.root,
+        )
+        text = self._report()
+        self.assertIn("## 已验证结论", text)
+        self.assertIn("无。进入名单不是已验证结论。", text)
+
+    def test_accept_refreshes_the_report(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        better = self._done_row("学习率", "1", "好于父本", "0.500000")
+        better["commit"] = head
+        better["parent"] = parent
+        judge.append_result(self.root / "results.tsv", better)
+        self.assertEqual(judge.main(["accept"], root=self.root), 0)
+        text = self._report()
+        self.assertIn(head[:7], text)
+        self.assertIn("待复核", text)

@@ -357,6 +357,103 @@ def record_accept(
         write_parents(parents_path, new_parents)
 
 
+def build_report(
+    config: dict | None,
+    rows: list[dict],
+    parents: list[dict],
+    queue: list[dict],
+) -> str:
+    out: list[str] = ["# 搜索报告", "", "## 标定", ""]
+    if config is None:
+        out.append("未标定。先运行 `uv run judge.py calibrate`。")
+    else:
+        out.append(f"- run_tag：{config['run_tag']}")
+        out.append(f"- run_start：{config['run_start']}")
+        out.append(f"- baseline：{config['baseline_commit'][:7]}")
+        out.append(f"- R = {config['repeats']}，Z = {config['z']}")
+        out.append(f"- σ = {config['sigma']:.6f}")
+        out.append(
+            f"- band（新父本）= {band_for(config['sigma'], config['z'], 1):.6f}"
+        )
+        out.append(f"- min_improvement = {config['min_improvement']:.6f}")
+        out.append(
+            f"- queue_limit = {config['queue_limit']}，"
+            f"rotate_after = {config['rotate_after']}"
+        )
+    out += ["", "## 轮次统计", ""]
+    groups: dict[str, dict[str, int]] = {}
+    for row in rows:
+        key = row["eval_hash"]
+        groups.setdefault(key, {})
+        groups[key][row["decision"]] = groups[key].get(row["decision"], 0) + 1
+    if not groups:
+        out.append("还没有记录。")
+    for key in sorted(groups):
+        out += [f"### 尺子 {key[:12]}", "", "| 判定 | 次数 |", "|---|---|"]
+        for decision in sorted(groups[key]):
+            out.append(f"| {decision} | {groups[key][decision]} |")
+        out.append("")
+    out += ["", "## 搜索结果（未验证）", ""]
+    if not parents:
+        out.append("名单为空。")
+    else:
+        out += ["| commit | 机制 | val_bpb | seeds | 已复核 |", "|---|---|---|---|---|"]
+        for row in parents:
+            out.append(
+                f"| {row['commit'][:7]} | {row['mechanism']} | {row['val_bpb']} "
+                f"| {row['seeds']} | {row['reviewed']} |"
+            )
+    out += ["", "## 已验证结论", ""]
+    holds = [row for row in rows if row["decision"] == "成立"]
+    if not holds:
+        out.append("无。进入名单不是已验证结论。")
+    else:
+        out += ["| commit | 机制 |", "|---|---|"]
+        for row in holds:
+            out.append(f"| {row['commit'][:7]} | {row['mechanism']} |")
+    out += ["", "## 未复核警告", ""]
+    if not queue:
+        out.append("队列为空。")
+    else:
+        out.append(f"还有 {len(queue)} 条待复核：")
+        for row in queue:
+            out.append(
+                f"- {row['commit'][:7]}（{row['mechanism']}，{row['accepted_at']}）"
+            )
+    out += ["", "## 机制审计", ""]
+    knobs_by_mechanism: dict[str, set[str]] = {}
+    for row in rows:
+        if row["seed"] not in {"1", "2"} or row["mechanism"] == "基线":
+            continue
+        knobs_by_mechanism.setdefault(row["mechanism"], set()).add(row["knobs"])
+    flagged = {
+        name: values for name, values in knobs_by_mechanism.items() if len(values) > 1
+    }
+    if not flagged:
+        out.append("同名机制的旋钮声明一致。")
+    else:
+        for name in sorted(flagged):
+            out.append(f"- {name}：{'、'.join(sorted(flagged[name]))}")
+    out.append("")
+    return "\n".join(out)
+
+
+def write_report(repo: Path) -> None:
+    text = build_report(
+        read_run(repo),
+        read_results(repo / "results.tsv"),
+        read_parents(repo / "parents.tsv"),
+        read_queue(repo / "queue.tsv"),
+    )
+    path = repo / "REPORT.md"
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
 def parse_summary(text: str) -> tuple[str | None, str | None]:
     seed = None
     val_bpb = None
@@ -493,7 +590,7 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(prog="judge.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("calibrate", "claim"):
+    for name in ("calibrate", "claim", "report"):
         sub.add_parser(name)
     accept_parser = sub.add_parser("accept")
     accept_parser.add_argument("--simpler", action="store_true")
@@ -506,6 +603,9 @@ def main(
     trial.add_argument("--fail", required=True)
     args = parser.parse_args(argv)
     repo = root or Path.cwd()
+    if args.cmd == "report":
+        write_report(repo)
+        return 0
     if args.cmd == "calibrate":
         return cmd_calibrate(
             repo,
@@ -719,6 +819,7 @@ def cmd_calibrate(
         "reviewed": "yes",
         "simpler": "no",
     }])
+    write_report(repo)
     return 0
 
 
@@ -779,6 +880,7 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
             "accepted_at": datetime.datetime.now().astimezone().isoformat(),
             "state": "待复核",
         }))
+    write_report(repo)
     return 0
 
 
@@ -828,6 +930,7 @@ def cmd_claim(repo: Path) -> int:
             apply_claim(read_parents(repo / "parents.tsv"), head, decision, mean),
         )
         write_queue(repo / "queue.tsv", dequeue(read_queue(repo / "queue.tsv"), head))
+    write_report(repo)
     return 0
 
 
