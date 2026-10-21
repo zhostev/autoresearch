@@ -638,7 +638,7 @@ def main(
         seed1 = [
             row for row in rows
             if row["commit"] == head and row["seed"] == "1"
-            and row["decision"] in {"基线", "好于父本", "持平", "差于父本"}
+            and row["decision"] in {"基线", "好于父本", "分不开", "差于父本"}
         ]
         if not seed1 or seed1[-1]["mechanism"] != args.mechanism:
             return 2

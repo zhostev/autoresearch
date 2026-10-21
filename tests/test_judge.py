@@ -1347,3 +1347,22 @@ class TestInstructionsV2(unittest.TestCase):
         ignored = Path(".gitignore").read_text(encoding="utf-8")
         for name in ("run.json", "queue.tsv", "REPORT.md"):
             self.assertIn(name, ignored)
+
+
+class TestSeed2OnATie(TestTrial):
+    def test_an_indistinguishable_commit_can_be_reviewed(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        tie = self._done_row("学习率", "1", "分不开", "1.000000")
+        tie["commit"] = head
+        tie["parent"] = parent
+        judge.append_result(self.root / "results.tsv", tie)
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "学习率",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.998000"),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            judge.read_results(self.root / "results.tsv")[-1]["decision"], "已记录"
+        )
