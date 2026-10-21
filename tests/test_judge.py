@@ -982,3 +982,129 @@ class TestRotation(unittest.TestCase):
         rows[3]["decision"] = "代码坏了"
         rows[4]["decision"] = "测量失败"
         self.assertTrue(judge.rotation_blocked(rows, 3, "p", 8))
+
+
+class TestQueue(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "queue.tsv"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _entry(self, commit):
+        return {
+            "commit": commit, "parent": "p", "mechanism": "学习率",
+            "accepted_at": "2026-10-21T00:00:00+08:00", "state": "待复核",
+        }
+
+    def test_round_trip_and_header(self):
+        judge.write_queue(self.path, [self._entry("a"), self._entry("b")])
+        self.assertEqual(
+            self.path.read_text(encoding="utf-8").splitlines()[0], judge.QUEUE_HEADER
+        )
+        self.assertEqual(
+            [row["commit"] for row in judge.read_queue(self.path)], ["a", "b"]
+        )
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(judge.read_queue(self.path), [])
+
+    def test_enqueue_appends_and_never_duplicates(self):
+        rows = judge.enqueue([], self._entry("a"))
+        rows = judge.enqueue(rows, self._entry("b"))
+        rows = judge.enqueue(rows, self._entry("a"))
+        self.assertEqual([row["commit"] for row in rows], ["a", "b"])
+
+    def test_dequeue_removes_only_that_commit(self):
+        rows = [self._entry("a"), self._entry("b")]
+        self.assertEqual([row["commit"] for row in judge.dequeue(rows, "a")], ["b"])
+        self.assertEqual(
+            [row["commit"] for row in judge.dequeue(rows, "zz")], ["a", "b"]
+        )
+
+
+class TestBackpressure(TestTrial):
+    def _fill_queue(self, count):
+        parent = git_head(self.root)
+        judge.write_queue(self.root / "queue.tsv", [{
+            "commit": parent, "parent": "p", "mechanism": f"m{index}",
+            "accepted_at": "2026-10-21T00:00:00+08:00", "state": "待复核",
+        } for index in range(count)])
+
+    def test_queue_at_the_limit_still_runs(self):
+        self._prepare_child()
+        self._fill_queue(2)
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.900000"),
+        )
+        self.assertEqual(code, 0)
+
+    def test_queue_over_the_limit_refuses_seed1(self):
+        self._prepare_child()
+        self._fill_queue(3)
+        before = len(judge.read_results(self.root / "results.tsv"))
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), before)
+
+    def test_queue_over_the_limit_still_allows_seed2(self):
+        self._prepare_child()
+        head = git_head(self.root)
+        seed1 = self._done_row("学习率", "1", "好于父本", "0.900000")
+        seed1["commit"] = head
+        judge.append_result(self.root / "results.tsv", seed1)
+        self._fill_queue(3)
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "学习率",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.910000"),
+        )
+        self.assertEqual(code, 0)
+
+    def test_simpler_replacement_also_enqueues(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        tie = self._done_row("学习率", "1", "分不开", "1.000000")
+        tie["commit"] = head
+        tie["parent"] = parent
+        judge.append_result(self.root / "results.tsv", tie)
+        code = judge.main(["accept", "--simpler", "--replace", parent], root=self.root)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [row["commit"] for row in judge.read_queue(self.root / "queue.tsv")], [head]
+        )
+
+    def test_accept_enqueues_a_better_commit(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        better = self._done_row("学习率", "1", "好于父本", "0.500000")
+        better["commit"] = head
+        better["parent"] = parent
+        judge.append_result(self.root / "results.tsv", better)
+        self.assertEqual(judge.main(["accept"], root=self.root), 0)
+        self.assertEqual(
+            [row["commit"] for row in judge.read_queue(self.root / "queue.tsv")], [head]
+        )
+
+    def test_unreachable_commits_are_pruned_instead_of_deadlocking(self):
+        self._prepare_child()
+        judge.write_queue(self.root / "queue.tsv", [{
+            "commit": "0" * 40, "parent": "p", "mechanism": f"m{index}",
+            "accepted_at": "2026-10-21T00:00:00+08:00", "state": "待复核",
+        } for index in range(3)])
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.900000"),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(judge.read_queue(self.root / "queue.tsv"), [])

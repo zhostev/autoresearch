@@ -227,6 +227,53 @@ def _line(fields: list[str], row: dict) -> str:
     return "\t".join(row[field] for field in fields)
 
 
+QUEUE_HEADER = "commit\tparent\tmechanism\taccepted_at\tstate"
+QUEUE_FIELDS = QUEUE_HEADER.split("\t")
+
+
+def read_queue(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = []
+    for line in lines[1:]:
+        if line == "":
+            continue
+        rows.append(dict(zip(QUEUE_FIELDS, line.split("\t"))))
+    return rows
+
+
+def write_queue(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(QUEUE_HEADER + "\n")
+        for row in rows:
+            handle.write(_line(QUEUE_FIELDS, row) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def enqueue(rows: list[dict], entry: dict) -> list[dict]:
+    if any(row["commit"] == entry["commit"] for row in rows):
+        return list(rows)
+    return list(rows) + [entry]
+
+
+def dequeue(rows: list[dict], commit: str) -> list[dict]:
+    return [row for row in rows if row["commit"] != commit]
+
+
+def prune_queue(repo: Path, rows: list[dict]) -> list[dict]:
+    kept = []
+    for row in rows:
+        if git_output(repo, "cat-file", "-e", row["commit"] + "^{commit}") is None:
+            continue
+        kept.append(row)
+    return kept
+
+
 def read_results(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -495,6 +542,19 @@ def main(
             config["rotate_after"],
         ):
             return 2
+        queue_path = repo / "queue.tsv"
+        queue_rows = read_queue(queue_path)
+        pruned = prune_queue(repo, queue_rows)
+        if pruned != queue_rows:
+            write_queue(queue_path, pruned)
+        if len(pruned) > config["queue_limit"]:
+            head_entry = pruned[0]
+            print(
+                f"队列积压 {len(pruned)} 条，先复核 {head_entry['commit'][:7]}"
+                f"（{head_entry['mechanism']}）",
+                file=sys.stderr,
+            )
+            return 2
     task_py, prepare_py, data_root = eval_paths(repo, root is not None)
     identity = eval_hash(task_py, prepare_py, data_root)
     row = blank_row()
@@ -688,6 +748,14 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
         result,
         None if decision == "未留下" else parents,
     )
+    if decision != "未留下":
+        write_queue(repo / "queue.tsv", enqueue(read_queue(repo / "queue.tsv"), {
+            "commit": head,
+            "parent": seed1["parent"],
+            "mechanism": seed1["mechanism"],
+            "accepted_at": datetime.datetime.now().astimezone().isoformat(),
+            "state": "待复核",
+        }))
     return 0
 
 
