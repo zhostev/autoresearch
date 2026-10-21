@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import math
@@ -189,7 +190,7 @@ RESULT_HEADER = (
     "commit\tparent\tmechanism\tknobs\texpect\tfail\tseed\tval_bpb\t"
     "eval_hash\tdecision\tdetail"
 )
-PARENT_HEADER = "commit\tmechanism\tval_bpb\tsimpler"
+PARENT_HEADER = "commit\tmechanism\tval_bpb\tseeds\treviewed\tsimpler"
 RESULT_FIELDS = RESULT_HEADER.split("\t")
 PARENT_FIELDS = PARENT_HEADER.split("\t")
 
@@ -376,7 +377,7 @@ def main(
 ) -> int:
     parser = argparse.ArgumentParser(prog="judge.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("baseline", "claim"):
+    for name in ("calibrate", "claim"):
         sub.add_parser(name)
     accept_parser = sub.add_parser("accept")
     accept_parser.add_argument("--simpler", action="store_true")
@@ -388,8 +389,13 @@ def main(
     trial.add_argument("--fail", required=True)
     args = parser.parse_args(argv)
     repo = root or Path.cwd()
-    if args.cmd == "baseline":
-        return cmd_baseline(repo, command or ["uv", "run", "train.py"], TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds, root is not None)
+    if args.cmd == "calibrate":
+        return cmd_calibrate(
+            repo,
+            command or ["uv", "run", "train.py"],
+            TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds,
+            root is not None,
+        )
     if args.cmd == "accept":
         return cmd_accept(repo, args.simpler, args.replace)
     if args.cmd == "claim":
@@ -482,63 +488,80 @@ def _bpb(row: dict | None) -> float | None:
     return float(row["val_bpb"])
 
 
-def cmd_baseline(repo: Path, command: list[str], timeout: float, test_root: bool) -> int:
+def calibration(scores: list[float], z: float) -> tuple[float, float]:
+    sigma = statistics.stdev(scores)
+    return sigma, z * sigma
+
+
+def cmd_calibrate(
+    repo: Path, command: list[str], timeout: float, test_root: bool
+) -> int:
     if is_dirty(repo):
         return 2
     head = git_output(repo, "rev-parse", "HEAD")
     if head is None:
         return 2
-    results_path = repo / "results.tsv"
-    rows = read_results(results_path)
-    existing = [
-        row for row in rows
-        if row["commit"] == head and row["seed"] == "1" and row["decision"] == "基线"
-    ]
-    if existing and not read_parents(repo / "parents.tsv"):
-        write_parents(repo / "parents.tsv", [{
-            "commit": head,
-            "mechanism": "基线",
-            "val_bpb": existing[-1]["val_bpb"],
-            "simpler": "no",
-        }])
-        return 0
-    if existing:
-        return 2
     task_py, prepare_py, data_root = eval_paths(repo, test_root)
-    row = blank_row()
-    row.update({
-        "commit": head,
-        "parent": "",
-        "mechanism": "基线",
-        "expect": "lower",
-        "fail": "基线",
-        "seed": "1",
-    })
     identity = eval_hash(task_py, prepare_py, data_root)
+    results_path = repo / "results.tsv"
     if identity is None:
-        row["decision"] = "代码坏了"
-        row["detail"] = "数据身份不可用"
+        row = blank_row()
+        row.update({
+            "commit": head, "mechanism": "基线", "expect": "lower",
+            "fail": "基线", "seed": "1", "decision": "代码坏了",
+            "detail": "数据身份不可用",
+        })
         append_result(results_path, row)
-        return 0
-    row["eval_hash"] = identity
-    code = run_command(command, "1", repo / "run.log", timeout)
-    log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
-    printed_seed, printed_bpb = parse_summary(log_text)
-    if code != 0 or printed_bpb is None:
-        row["decision"] = "代码坏了"
+        return 2
+    repeats = 5
+    z = 2.0
+    scores: list[float] = []
+    for index in range(repeats):
+        seed = str(index + 1)
+        row = blank_row()
+        row.update({
+            "commit": head, "mechanism": "基线", "expect": "lower",
+            "fail": "基线", "seed": seed, "eval_hash": identity,
+        })
+        code = run_command(command, seed, repo / "run.log", timeout)
+        log_path = repo / "run.log"
+        log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        printed_seed, printed_bpb = parse_summary(log_text)
+        if code != 0 or printed_bpb is None:
+            row["decision"] = "代码坏了"
+            append_result(results_path, row)
+            return 2
+        if printed_seed != seed:
+            row["decision"] = "测量失败"
+            append_result(results_path, row)
+            return 2
+        row["val_bpb"] = printed_bpb
+        row["decision"] = "基线"
         append_result(results_path, row)
-        return 0
-    if printed_seed != "1":
-        row["decision"] = "测量失败"
-        append_result(results_path, row)
-        return 0
-    row["val_bpb"] = printed_bpb
-    row["decision"] = "基线"
-    append_result(results_path, row)
+        scores.append(float(printed_bpb))
+    sigma, min_improvement = calibration(scores, z)
+    if sigma <= 0.0:
+        return 2
+    tag = git_output(repo, "rev-parse", "--abbrev-ref", "HEAD") or ""
+    write_run(repo, {
+        "run_tag": tag.rsplit("/", 1)[-1],
+        "run_start": datetime.datetime.now().astimezone().isoformat(),
+        "baseline_commit": head,
+        "eval_hash": identity,
+        "repeats": repeats,
+        "z": z,
+        "sigma": sigma,
+        "min_improvement": min_improvement,
+        "queue_limit": 2,
+        "rotate_after": 8,
+    })
+    mean = statistics.fmean(scores)
     write_parents(repo / "parents.tsv", [{
         "commit": head,
         "mechanism": "基线",
-        "val_bpb": printed_bpb,
+        "val_bpb": f"{mean:.6f}",
+        "seeds": ",".join(str(index + 1) for index in range(repeats)),
+        "reviewed": "yes",
         "simpler": "no",
     }])
     return 0
@@ -562,6 +585,8 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
         "commit": head,
         "mechanism": seed1["mechanism"],
         "val_bpb": seed1["val_bpb"],
+        "seeds": "1",
+        "reviewed": "no",
         "simpler": "yes" if simpler else "no",
     }
     try:

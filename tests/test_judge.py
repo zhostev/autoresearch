@@ -1,4 +1,5 @@
 import math
+import statistics
 import sys
 import unittest
 from pathlib import Path
@@ -195,6 +196,8 @@ class TestTsv(unittest.TestCase):
                 "commit": "abc",
                 "mechanism": "学习率",
                 "val_bpb": "0.900000",
+                "seeds": "1",
+                "reviewed": "no",
                 "simpler": "no",
             }]
             with self.assertRaises(OSError):
@@ -313,6 +316,8 @@ class TestTrial(unittest.TestCase):
             "commit": parent,
             "mechanism": "基线",
             "val_bpb": "1.000000",
+            "seeds": "1,2,3,4,5",
+            "reviewed": "yes",
             "simpler": "no",
         }])
         base = self._done_row("基线", "1", "基线", "1.000000")
@@ -493,6 +498,8 @@ class TestCommands(TestTrial):
             "commit": git_head(self.root),
             "mechanism": "基线",
             "val_bpb": "1.000000",
+            "seeds": "1,2,3,4,5",
+            "reviewed": "yes",
             "simpler": "no",
         }])
         before = (self.root / "parents.tsv").read_text(encoding="utf-8")
@@ -528,21 +535,6 @@ class TestCommands(TestTrial):
         self.assertEqual(claim["decision"], "还判不了")
         self.assertEqual(claim["detail"], "缺父本种子2")
         self.assertEqual(claim["seed"], "*")
-
-    def test_baseline_repair_does_not_train(self):
-        head = git_head(self.root)
-        row = self._done_row("基线", "1", "基线", "1.000000")
-        row["commit"] = head
-        judge.append_result(self.root / "results.tsv", row)
-        code = judge.main(
-            ["baseline"],
-            command=["python", "-c", "raise SystemExit('trained')"],
-            root=self.root,
-        )
-        self.assertEqual(code, 0)
-        parents = judge.read_parents(self.root / "parents.tsv")
-        self.assertEqual(parents[0]["commit"], head)
-        self.assertEqual(len(judge.read_results(self.root / "results.tsv")), 1)
 
     def test_seed1_better_does_not_change_parents_or_head(self):
         import sys
@@ -737,3 +729,79 @@ class TestRunConfig(unittest.TestCase):
         expected = judge.band_for(0.004, 2.0, 1)
         self.assertEqual(judge.band_for(0.004, 2.0, 0), expected)
         self.assertEqual(judge.band_for(0.004, 2.0, -3), expected)
+
+
+class TestCalibrate(TestTrial):
+    def _fake_scores(self, values):
+        table = ", ".join(
+            f"'{index + 1}': '{value}'" for index, value in enumerate(values)
+        )
+        script = self.root / "fake_train.py"
+        script.write_text(
+            "import os\n"
+            f"table = {{{table}}}\n"
+            "seed = os.environ['AUTORES_SEED']\n"
+            "print('seed: ' + seed)\n"
+            "print('val_bpb:          ' + table[seed])\n",
+            encoding="utf-8",
+        )
+        return [sys.executable, str(script)]
+
+    def _calibrate(self, values, timeout=5):
+        return judge.main(
+            ["calibrate"],
+            command=self._fake_scores(values),
+            timeout_seconds=timeout,
+            root=self.root,
+        )
+
+    def test_five_seeds_are_recorded_and_sigma_is_written(self):
+        values = ["1.000000", "1.004000", "0.996000", "1.002000", "0.998000"]
+        self.assertEqual(self._calibrate(values), 0)
+        rows = judge.read_results(self.root / "results.tsv")
+        self.assertEqual(len(rows), 5)
+        self.assertEqual([row["seed"] for row in rows], ["1", "2", "3", "4", "5"])
+        self.assertTrue(all(row["decision"] == "基线" for row in rows))
+        self.assertTrue(all(row["mechanism"] == "基线" for row in rows))
+        config = judge.read_run(self.root)
+        expected = statistics.stdev([float(value) for value in values])
+        self.assertAlmostEqual(config["sigma"], expected, places=12)
+        self.assertAlmostEqual(config["min_improvement"], 2.0 * expected, places=12)
+        self.assertEqual(config["repeats"], 5)
+        self.assertEqual(config["queue_limit"], 2)
+        self.assertEqual(config["rotate_after"], 8)
+        self.assertEqual(config["baseline_commit"], git_head(self.root))
+
+    def test_parent_list_holds_the_mean_of_every_seed(self):
+        values = ["1.000000", "1.004000", "0.996000", "1.002000", "0.998000"]
+        self._calibrate(values)
+        parents = judge.read_parents(self.root / "parents.tsv")
+        self.assertEqual(len(parents), 1)
+        self.assertAlmostEqual(float(parents[0]["val_bpb"]), 1.0, places=9)
+        self.assertEqual(parents[0]["seeds"], "1,2,3,4,5")
+        self.assertEqual(parents[0]["reviewed"], "yes")
+
+    def test_zero_variance_is_refused(self):
+        values = ["1.000000"] * 5
+        self.assertEqual(self._calibrate(values), 2)
+        self.assertIsNone(judge.read_run(self.root))
+        self.assertEqual(judge.read_parents(self.root / "parents.tsv"), [])
+
+    def test_a_crash_aborts_the_whole_calibration(self):
+        script = self.root / "boom.py"
+        script.write_text("raise SystemExit(1)\n", encoding="utf-8")
+        code = judge.main(
+            ["calibrate"],
+            command=[sys.executable, str(script)],
+            timeout_seconds=5,
+            root=self.root,
+        )
+        self.assertEqual(code, 2)
+        rows = judge.read_results(self.root / "results.tsv")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["decision"], "代码坏了")
+        self.assertIsNone(judge.read_run(self.root))
+
+    def test_baseline_subcommand_is_gone(self):
+        with self.assertRaises(SystemExit):
+            judge.main(["baseline"], command=["true"], timeout_seconds=1, root=self.root)
