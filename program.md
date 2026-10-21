@@ -13,7 +13,7 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Do not create the tables by hand**: Leave `results.tsv` and `parents.tsv` uncreated. `uv run judge.py baseline` writes the first row and the parent list.
+5. **Do not create the tables by hand**: Leave `results.tsv`, `parents.tsv`, `queue.tsv`, and `run.json` uncreated. `uv run judge.py calibrate` writes the baseline rows, the parent list, and the calibration.
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
@@ -42,32 +42,62 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 ## The experiment loop
 
-Work on a branch such as `autoresearch/mar5`. The first command on a clean baseline commit is:
+Work on a branch such as `autoresearch/mar5`. The first command on a clean
+baseline commit is:
 
 ```text
-uv run judge.py baseline
+uv run judge.py calibrate
 ```
+
+It trains five times at seeds 1–5, measures the seed-to-seed standard
+deviation, and writes `run.json`. Everything after it — the accept band, the
+claim threshold — comes from that number. A trial whose score sits inside the
+band is `分不开`: indistinguishable from noise, not an improvement.
 
 LOOP FOREVER:
 
-1. Read `parents.tsv` and `results.tsv`. Do not always continue from the most recently accepted parent.
-2. Check out the chosen parent commit.
-3. Write down the mechanism in three facts: a short mechanism name, whether you expect `val_bpb` to go `lower` or `higher`, and one sentence for what counts as failure. The same short name is the same mechanism even if the other two sentences change.
-4. Edit `train.py` and git commit. The new commit's parent must be the chosen parent.
+1. Read `parents.tsv`, `results.tsv`, and `queue.tsv`. When the queue is over
+   its limit, `judge.py` refuses new seed-1 trials — go review instead.
+2. Check out a parent commit from the list. After enough tries from one
+   parent, `judge.py` refuses it and you must pick another.
+3. Write down the mechanism in three facts: a short mechanism name, whether you
+   expect `val_bpb` to go `lower` or `higher`, and one sentence for what counts
+   as failure. The same short name is the same mechanism even if the other two
+   sentences change.
+4. Edit `train.py` and git commit. The new commit's parent must be the chosen
+   parent. List every module-level constant your edit changed; that list is
+   `--knobs`. Declaring nothing while the diff changes a constant is refused
+   before any training happens.
 5. Run:
 
 ```text
-uv run judge.py trial --seed 1 --mechanism 学习率 --expect lower --fail 变高或崩溃
+uv run judge.py trial --seed 1 --mechanism 学习率 --knobs LEARNING_RATE \
+    --expect lower --fail 变高或崩溃
 ```
 
-6. Read the new `results.tsv` row. `judge.py` does not create commits and does not reset them.
-7. If the decision is `好于父本` and the complexity is worth keeping, leave the commit and run `uv run judge.py accept`.
-8. If the decision is `持平` and the code is simpler, leave the commit and run `uv run judge.py accept --simpler --replace <parent-hash>`.
-9. If the decision is `差于父本`, or the complexity is not worth it, `git reset` back to the parent. Do not run `accept`.
-10. If the decision is `代码坏了`, fix a typo or missing import and try again. If the idea itself cannot run, leave the crash row and move on. Do not describe that crash as the mechanism being worse.
-11. If the decision is `测量失败`, do not accept the commit. Reset and fix the seed printing before counting the idea.
+6. Read the new `results.tsv` row. `judge.py` does not create commits and does
+   not reset them.
+7. If the decision is `好于父本` and the complexity is worth keeping, leave the
+   commit and run `uv run judge.py accept`.
+8. If the decision is `分不开` and the code is simpler, leave the commit and run
+   `uv run judge.py accept --simpler --replace <parent-hash>`.
+9. If the decision is `差于父本`, or the complexity is not worth it, `git reset`
+   back to the parent. Do not run `accept`.
+10. If the decision is `代码坏了`, fix a typo or missing import and try again. If
+    the idea itself cannot run, leave the crash row and move on. Do not describe
+    that crash as the mechanism being worse.
+11. If the decision is `测量失败`, do not accept the commit. Reset and fix the
+    seed printing before counting the idea.
+12. When `queue.tsv` is not empty, pick an entry and review it: check out that
+    commit, run `trial --seed 2` with the same short mechanism name, then run
+    `uv run judge.py claim` on it. A review also replaces that parent's
+    single-seed basis with the mean of its two seeds.
 
 Overnight search uses seed 1 only. The parent list holds at most three commits.
+
+`judge.py` rewrites `REPORT.md` after every `calibrate`, `accept`, and `claim`.
+Read it instead of keeping your own tally; `uv run judge.py report` recomputes
+it on demand.
 
 ## Morning claim
 

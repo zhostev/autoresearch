@@ -1319,3 +1319,31 @@ class TestReportIsWritten(TestTrial):
         text = self._report()
         self.assertIn(head[:7], text)
         self.assertIn("待复核", text)
+
+
+class TestInstructionsV2(unittest.TestCase):
+    def setUp(self):
+        self.text = Path("program.md").read_text(encoding="utf-8")
+
+    def test_commands_are_v2(self):
+        self.assertIn("judge.py calibrate", self.text)
+        self.assertIn("--knobs", self.text)
+        self.assertIn("judge.py report", self.text)
+        self.assertNotIn("judge.py baseline", self.text)
+
+    def test_mechanised_rules_are_no_longer_advice(self):
+        self.assertNotIn("不要总从最近", self.text)
+        self.assertNotIn("Do not always continue from the most recently", self.text)
+
+    def test_the_old_tie_word_is_gone(self):
+        self.assertNotIn("持平", self.text)
+        self.assertIn("分不开", self.text)
+
+    def test_the_hold_is_still_spelled_out(self):
+        self.assertIn("成立", self.text)
+        self.assertIn("进入名单", self.text)
+
+    def test_gitignore_covers_the_new_state_files(self):
+        ignored = Path(".gitignore").read_text(encoding="utf-8")
+        for name in ("run.json", "queue.tsv", "REPORT.md"):
+            self.assertIn(name, ignored)
