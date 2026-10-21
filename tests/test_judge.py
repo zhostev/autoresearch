@@ -1603,16 +1603,28 @@ class TestManifestIgnoresScratchFiles(unittest.TestCase):
         self.assertEqual(judge.data_manifest(self.data), before)
 
 
-class TestTaskCoversTheTokenizer(unittest.TestCase):
-    def test_data_root_is_the_cache_dir_not_just_data(self):
-        text = Path("task.py").read_text(encoding="utf-8")
-        self.assertIn("DATA_ROOT = Path(prepare.CACHE_DIR)", text)
-        self.assertNotIn("DATA_ROOT = Path(prepare.DATA_DIR)", text)
+class TestTaskContract(unittest.TestCase):
+    """task.py 的契约对任何任务都成立；只有最后一条是 nanochat 专有的。"""
 
-    def test_train_takes_its_loader_from_task(self):
-        text = Path("train.py").read_text(encoding="utf-8")
-        self.assertNotIn("make_dataloader", text)
-        self.assertIn("load_train", text)
+    def setUp(self):
+        self.task = Path("task.py").read_text(encoding="utf-8")
+        self.train = Path("train.py").read_text(encoding="utf-8")
+
+    def test_task_exports_the_required_names(self):
+        for name in ("NAME", "DATA_ROOT", "TIME_BUDGET", "def score("):
+            self.assertIn(name, self.task)
+
+    def test_train_takes_its_data_from_task(self):
+        self.assertIn("from task import", self.train)
+
+    def test_train_does_not_reach_past_task_for_a_loader(self):
+        self.assertNotIn("make_dataloader", self.train)
+
+    def test_the_nanochat_ruler_covers_the_tokenizer(self):
+        if 'NAME = "nanochat"' not in self.task:
+            self.skipTest("这个分支跑的不是 nanochat 任务")
+        self.assertIn("DATA_ROOT = Path(prepare.CACHE_DIR)", self.task)
+        self.assertNotIn("DATA_ROOT = Path(prepare.DATA_DIR)", self.task)
 
 
 class TestReportCountsTrialsOnly(unittest.TestCase):
