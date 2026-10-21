@@ -121,6 +121,12 @@ Then, on the candidate commit, run:
 uv run judge.py claim
 ```
 
+`claim` pools every seed each side was measured at -- not just the first two --
+and its threshold is the accept band raised to `min_improvement` and then
+widened by a luck penalty for the number of mechanisms tried, so it is always
+stricter than the band that let the commit into the list. Its detail column
+records how many measurements each arm contributed.
+
 Only a `claim` row whose decision is `成立` is a validated result. `还判不了` means the materials were insufficient. `进入名单` is not that result.
 
 `judge.py` kills a training run that exceeds 10 minutes and records `代码坏了`.

@@ -108,13 +108,6 @@ def compare_to_parent(candidate: float, parent: float, band: float) -> str:
     return "分不开"
 
 
-def luck_penalty(candidate_a: float, candidate_b: float, n: int) -> float:
-    if n <= 1:
-        return 0.0
-    sigma = statistics.stdev([candidate_a, candidate_b])
-    return sigma * math.sqrt(2.0 * math.log(n))
-
-
 def count_n(rows: list[dict]) -> int:
     names = {
         row["mechanism"]
@@ -125,42 +118,43 @@ def count_n(rows: list[dict]) -> int:
 
 
 def claim_verdict(
-    candidate_seed1: float | None,
-    candidate_seed2: float | None,
-    parent_seed1: float | None,
-    parent_seed2: float | None,
+    candidate: list[float],
+    parent: list[float],
     eval_hashes: list[str],
+    sigma: float | None,
+    z: float,
     min_improvement: float | None,
     n: int,
 ) -> tuple[str, str]:
-    missing = []
-    if candidate_seed1 is None:
-        missing.append("候选种子1")
-    if candidate_seed2 is None:
-        missing.append("候选种子2")
-    if parent_seed1 is None:
-        missing.append("父本种子1")
-    if parent_seed2 is None:
-        missing.append("父本种子2")
-    if missing:
-        return "还判不了", "缺" + "、".join(missing)
+    """终局判定。两臂各用自己全部样本的均值，门槛恒严于 accept 的带宽。
+
+    门槛 = max(band, min_improvement) + 碰运气扣减。
+    claim 要求两臂各至少 2 个样本，所以 band = z·σ·√(1/m+1/n) ≤ z·σ，
+    而 calibrate 写入的 min_improvement 正是 z·σ，因此门槛永远不低于
+    min_improvement，也永远高于 accept 用的那条带宽。
+
+    扣减用标定的 σ，不用候选自己那两三个样本的标准差：错误率是离散的，
+    两个种子很容易给出同一个分数，σ_cand 会退化成 0 让扣减失效。
+    """
+    if len(candidate) < 2:
+        return "还判不了", "缺候选样本"
+    if len(parent) < 2:
+        return "还判不了", "缺父本样本"
     if (
-        len(eval_hashes) != 4
+        len(eval_hashes) < 2
         or len(set(eval_hashes)) != 1
         or any(item == "" for item in eval_hashes)
     ):
         return "还判不了", "尺子或数据不同"
-    if min_improvement is None or min_improvement <= 0:
+    if sigma is None or sigma <= 0 or min_improvement is None or min_improvement <= 0:
         return "还判不了", "未标定"
-    improvement_1 = parent_seed1 - candidate_seed1
-    improvement_2 = parent_seed2 - candidate_seed2
-    if improvement_1 == improvement_2 and improvement_1 != 0:
-        return "还判不了", "两次改进没有分开"
-    average = (improvement_1 + improvement_2) / 2.0
-    if average < 0:
+    improvement = statistics.fmean(parent) - statistics.fmean(candidate)
+    if improvement < 0:
         return "更差", ""
-    penalty = luck_penalty(candidate_seed1, candidate_seed2, n)
-    if average > min_improvement and average - penalty > min_improvement:
+    band = band_for(sigma, z, len(parent), len(candidate))
+    penalty = sigma * math.sqrt(2.0 * math.log(n)) if n > 1 else 0.0
+    threshold = max(band, min_improvement) + penalty
+    if improvement > threshold:
         return "成立", ""
     return "没有更好", ""
 
@@ -1082,37 +1076,36 @@ def cmd_claim(repo: Path, test_root: bool) -> int:
         result["detail"] = "缺父本提交"
         append_result(repo / "results.tsv", result)
         return 0
-    slots = [
-        _latest(rows, head, "1"),
-        _latest(rows, head, "2"),
-        _latest(rows, parent, "1"),
-        _latest(rows, parent, "2"),
-    ]
-    seed1 = slots[0]
+    candidate = sample_scores(rows, head)
+    parent_samples = sample_scores(rows, parent)
+    seed1 = _latest(rows, head, "1")
     if seed1 is not None:
         result["mechanism"] = seed1["mechanism"]
         result["expect"] = seed1["expect"]
         result["fail"] = seed1["fail"]
+    used = [
+        row for row in rows
+        if row["commit"] in (head, parent)
+        and row["val_bpb"] != ""
+        and row["decision"] in COMPLETED_DECISIONS
+    ]
     decision, detail = claim_verdict(
-        _bpb(slots[0]),
-        _bpb(slots[1]),
-        _bpb(slots[2]),
-        _bpb(slots[3]),
-        [row["eval_hash"] if row else "" for row in slots],
+        [candidate[key] for key in sorted(candidate, key=int)],
+        [parent_samples[key] for key in sorted(parent_samples, key=int)],
+        [row["eval_hash"] for row in used],
+        config["sigma"],
+        config["z"],
         config["min_improvement"],
         count_n(rows),
     )
     result["decision"] = decision
+    if decision in FINAL_CLAIMS:
+        detail = f"候选 {len(candidate)} 次 vs 父本 {len(parent_samples)} 次"
     result["detail"] = detail
     append_result(repo / "results.tsv", result)
     if decision in FINAL_CLAIMS:
-        measured = sample_scores(read_results(repo / "results.tsv"), head)
-        if measured:
-            mean = statistics.fmean(measured.values())
-            seeds = ",".join(sorted(measured, key=int))
-        else:
-            mean = _bpb(slots[0]) or 0.0
-            seeds = "1,2"
+        mean = statistics.fmean(candidate.values())
+        seeds = ",".join(sorted(candidate, key=int))
         write_parents(
             repo / "parents.tsv",
             apply_claim(

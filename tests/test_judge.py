@@ -18,77 +18,6 @@ class TestClaim(unittest.TestCase):
         self.assertEqual(judge.TIMEOUT_SECONDS, 600)
         self.assertFalse(hasattr(judge, "MIN_IMPROVEMENT"))
 
-    def test_missing_inputs_have_distinct_details(self):
-        hashes = ["a", "a", "a", "a"]
-        cases = [
-            (None, 0.9, 1.0, 1.0, "缺候选种子1"),
-            (0.9, None, 1.0, 1.0, "缺候选种子2"),
-            (0.9, 0.9, None, 1.0, "缺父本种子1"),
-            (0.9, 0.9, 1.0, None, "缺父本种子2"),
-        ]
-        for scores in cases:
-            decision, detail = judge.claim_verdict(
-                *scores[:4], hashes, 0.001, 1
-            )
-            self.assertEqual(decision, "还判不了")
-            self.assertEqual(detail, scores[4])
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, hashes, None, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "未标定"))
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, hashes, 0.0, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "未标定"))
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, hashes, -0.1, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "未标定"))
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, ["a", "b", "a", "a"], 0.001, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
-        decision, detail = judge.claim_verdict(
-            0.99, 0.99, 1.0, 1.0, hashes, 0.001, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "两次改进没有分开"))
-
-    def test_worse_and_tie(self):
-        hashes = ["a", "a", "a", "a"]
-        decision, detail = judge.claim_verdict(
-            1.1, 1.2, 1.0, 1.0, hashes, 0.001, 1
-        )
-        self.assertEqual(decision, "更差")
-        decision, detail = judge.claim_verdict(
-            1.0, 1.0, 1.0, 1.0, hashes, 0.001, 1
-        )
-        self.assertEqual(decision, "没有更好")
-
-    def test_penalty_example(self):
-        rows = [
-            {"decision": "好于父本", "mechanism": "学习率"},
-            {"decision": "差于父本", "mechanism": "深度"},
-            {"decision": "代码坏了", "mechanism": "窗口"},
-            {"decision": "已记录", "mechanism": "学习率"},
-            {"decision": "基线", "mechanism": "基线"},
-            {"decision": "进入名单", "mechanism": "优化器"},
-        ]
-        self.assertEqual(judge.count_n(rows), 3)
-        penalty = judge.luck_penalty(0.990, 0.996, 4)
-        self.assertAlmostEqual(penalty, 0.007064460135092854, delta=1e-12)
-        hashes = ["h", "h", "h", "h"]
-        self.assertEqual(
-            judge.claim_verdict(0.990, 0.996, 1.000, 1.002, hashes, 0.001, 4)[0],
-            "没有更好",
-        )
-        self.assertEqual(
-            judge.claim_verdict(0.990, 0.996, 1.000, 1.002, hashes, 0.0005, 4)[0],
-            "成立",
-        )
-        self.assertEqual(judge.luck_penalty(0.5, 0.6, 1), 0.0)
-        self.assertEqual(judge.count_n([{"decision": "基线", "mechanism": "基线"}]), 0)
-
-
 class TestParents(unittest.TestCase):
     def _row(self, commit, mechanism, val_bpb, simpler="no"):
         return {
@@ -552,7 +481,7 @@ class TestCommands(TestTrial):
         self.assertEqual(code, 0)
         claim = judge.read_results(self.root / "results.tsv")[-1]
         self.assertEqual(claim["decision"], "还判不了")
-        self.assertEqual(claim["detail"], "缺父本种子2")
+        self.assertEqual(claim["detail"], "缺父本样本")
         self.assertEqual(claim["seed"], "*")
 
     def test_seed1_better_does_not_change_parents_or_head(self):
@@ -1109,37 +1038,6 @@ class TestBackpressure(TestTrial):
         self.assertEqual(judge.read_queue(self.root / "queue.tsv"), [])
 
 
-class TestClaimV2(unittest.TestCase):
-    def _hashes(self):
-        return ["e"] * 4
-
-    def test_one_hash_list_replaces_two(self):
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, ["e", "f", "e", "e"], 0.001, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
-
-    def test_uncalibrated_says_so(self):
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, self._hashes(), None, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "未标定"))
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, self._hashes(), 0.0, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "未标定"))
-
-    def test_penalty_example_still_holds(self):
-        decision, _ = judge.claim_verdict(
-            0.990, 0.996, 1.000, 1.002, self._hashes(), 0.001, 4
-        )
-        self.assertEqual(decision, "没有更好")
-        decision, _ = judge.claim_verdict(
-            0.990, 0.996, 1.000, 1.002, self._hashes(), 0.0005, 4
-        )
-        self.assertEqual(decision, "成立")
-
-
 class TestClaimSideEffects(unittest.TestCase):
     def _parents(self):
         return [
@@ -1496,20 +1394,6 @@ class TestReplaceMustNameTheOwnParent(TestTrial):
         )
 
 
-class TestMissingScoreBeatsHashAlarm(unittest.TestCase):
-    def test_an_absent_row_is_a_missing_score_not_a_moved_ruler(self):
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, None, ["e", "e", "e", ""], 0.001, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "缺父本种子2"))
-
-    def test_four_present_but_unequal_hashes_still_alarm(self):
-        decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, ["e", "f", "e", "e"], 0.001, 1
-        )
-        self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
-
-
 class TestKnobsRegexCoverage(unittest.TestCase):
     def test_annotated_assignment_counts(self):
         self.assertEqual(
@@ -1611,7 +1495,7 @@ class TestTaskContract(unittest.TestCase):
         self.train = Path("train.py").read_text(encoding="utf-8")
 
     def test_task_exports_the_required_names(self):
-        for name in ("NAME", "DATA_ROOT", "TIME_BUDGET", "def score("):
+        for name in ("NAME", "DATA_ROOT", "TIME_BUDGET", "def score(", "def should_stop("):
             self.assertIn(name, self.task)
 
     def test_train_takes_its_data_from_task(self):
@@ -2000,3 +1884,103 @@ class TestInstructionsDescribeEscalation(unittest.TestCase):
         text = Path("program.md").read_text(encoding="utf-8")
         self.assertIn("追加测量", text)
         self.assertIn("trial_repeats", text)
+
+
+class TestClaimUsesEverySample(unittest.TestCase):
+    """缺陷 5：claim 原本只配对 seed1/seed2，比 accept 还弱。"""
+
+    def _hashes(self, count):
+        return ["e"] * count
+
+    def test_both_arms_are_pooled(self):
+        # 候选 3 个样本均值 0.9，父本 5 个样本均值 1.0，改进 0.1。
+        decision, detail = judge.claim_verdict(
+            [0.88, 0.92, 0.90], [0.98, 1.00, 1.02, 0.99, 1.01],
+            self._hashes(8), 0.004, 2.0, 0.008, 1,
+        )
+        self.assertEqual((decision, detail), ("成立", ""))
+
+    def test_a_single_bad_second_seed_no_longer_decides_alone(self):
+        # 旧设计只看 seed1/seed2：(1.00-0.88) 与 (1.02-0.95) 平均 0.095 本来也成立，
+        # 但若父本 seed2 恰好是好抽样，旧设计会被它一个样本拖垮。合并后看全部。
+        decision, _ = judge.claim_verdict(
+            [0.88, 0.95, 0.89], [1.00, 0.96, 1.02, 1.01, 1.03],
+            self._hashes(8), 0.004, 2.0, 0.008, 1,
+        )
+        self.assertEqual(decision, "成立")
+
+    def test_claim_is_strictly_stricter_than_accept(self):
+        sigma, z = 0.004, 2.0
+        candidate = [0.9900, 0.9910, 0.9890]
+        parent = [1.0000, 1.0010, 0.9990, 1.0005, 0.9995]
+        band = judge.band_for(sigma, z, len(parent), len(candidate))
+        improvement = statistics.fmean(parent) - statistics.fmean(candidate)
+        # accept 会放行：改进超过带宽。
+        self.assertGreater(improvement, band)
+        self.assertEqual(
+            judge.compare_to_parent(
+                statistics.fmean(candidate), statistics.fmean(parent), band
+            ),
+            "好于父本",
+        )
+        # claim 不放行：门槛是 max(band, min_improvement) 再加碰运气扣减。
+        decision, _ = judge.claim_verdict(
+            candidate, parent, self._hashes(8), sigma, z, z * sigma, 4
+        )
+        self.assertEqual(decision, "没有更好")
+
+    def test_the_luck_penalty_still_bites(self):
+        args = ([0.980, 0.982, 0.978], [1.000, 1.001, 0.999, 1.002, 0.998],
+                self._hashes(8), 0.004, 2.0, 0.008)
+        self.assertEqual(judge.claim_verdict(*args, 1)[0], "成立")
+        self.assertEqual(judge.claim_verdict(*args, 400)[0], "没有更好")
+
+    def test_identical_candidate_scores_no_longer_block(self):
+        # 错误率是离散的，两个种子给出同一个分数很常见；旧设计会判「还判不了」。
+        decision, _ = judge.claim_verdict(
+            [0.900, 0.900], [1.000, 1.000, 1.000, 1.000, 1.000],
+            self._hashes(7), 0.004, 2.0, 0.008, 1,
+        )
+        self.assertEqual(decision, "成立")
+
+    def test_too_few_samples_names_the_gap(self):
+        decision, detail = judge.claim_verdict(
+            [0.9], [1.0, 1.0], self._hashes(3), 0.004, 2.0, 0.008, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "缺候选样本"))
+        decision, detail = judge.claim_verdict(
+            [0.9, 0.9], [1.0], self._hashes(3), 0.004, 2.0, 0.008, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "缺父本样本"))
+
+    def test_a_moved_ruler_still_alarms(self):
+        decision, detail = judge.claim_verdict(
+            [0.9, 0.9], [1.0, 1.0], ["e", "f", "e", "e"], 0.004, 2.0, 0.008, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
+
+    def test_uncalibrated_says_so(self):
+        decision, detail = judge.claim_verdict(
+            [0.9, 0.9], [1.0, 1.0], self._hashes(4), None, 2.0, 0.008, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "未标定"))
+
+    def test_worse_is_still_worse(self):
+        decision, _ = judge.claim_verdict(
+            [1.1, 1.2], [1.0, 1.0], self._hashes(4), 0.004, 2.0, 0.008, 1
+        )
+        self.assertEqual(decision, "更差")
+
+
+class TestStopRuleIsFrozen(unittest.TestCase):
+    """缺陷 6：预算的执行权原本一半在 agent 可改的 train.py 里。"""
+
+    def test_task_exports_the_stop_rule(self):
+        text = Path("task.py").read_text(encoding="utf-8")
+        self.assertIn("def should_stop(", text)
+
+    def test_train_defers_to_it(self):
+        text = Path("train.py").read_text(encoding="utf-8")
+        self.assertIn("should_stop(", text)
+        self.assertNotIn("elapsed >= TIME_BUDGET", text)
+        self.assertNotIn("* TIME_BUDGET:", text)

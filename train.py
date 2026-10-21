@@ -24,7 +24,7 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, Tokenizer, seed_everything
-from task import TIME_BUDGET, load_train, score
+from task import TIME_BUDGET, load_train, score, should_stop
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -601,7 +601,7 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > 10 and should_stop(step, total_training_time):
         break
 
 print()  # newline after \r training log
