@@ -1734,3 +1734,52 @@ class TestRefusalsSpeak(TestTrial):
         source = Path("judge.py").read_text(encoding="utf-8")
         body = source.split("def refuse(", 1)[1].split("\n\n\n", 1)[1]
         self.assertEqual(re.findall(r"^\s*return 2$", body, re.M), [])
+
+
+class TestTwoRulersAreNeverCompared(TestTrial):
+    """端到端：候选和父本的分数必须出自同一把尺子。
+
+    flower14 的二号根因：`ac0a661` 在搜索中途把验证集从 98 张换成 1498 张，
+    而 148 行记录的数据哈希一个字节都没变，于是两版评测下的分数被直接比大小。
+    v2 把哈希算对了，这条测试钉住的是「拿它挡人」那一步。
+    """
+
+    def test_a_commit_that_moves_the_ruler_cannot_reach_the_parent_list(self):
+        baseline = git_head(self.root)
+        calibrated = self._write_run()["eval_hash"]
+        judge.write_parents(self.root / "parents.tsv", [{
+            "commit": baseline, "mechanism": "基线", "val_bpb": "1.000000",
+            "seeds": "1,2,3,4,5", "reviewed": "yes", "simpler": "no",
+        }])
+        base_row = self._done_row("基线", "1", "基线", "1.000000")
+        base_row["commit"] = baseline
+        judge.append_result(self.root / "results.tsv", base_row)
+
+        # 一个提交里同时改 train.py 和 task.py。两道旧闸门都看不见它：
+        # is_dirty 只查未提交的改动，knobs 只看 `git diff -- train.py`。
+        (self.root / "train.py").write_text("print('v2')\n", encoding="utf-8")
+        (self.root / "task.py").write_text(
+            "NAME = 'test'\nHOLDOUT = 900\n", encoding="utf-8"
+        )
+        self._git("add", "train.py", "task.py")
+        self._git("commit", "-m", "mechanism and a quietly different ruler")
+        self.assertNotEqual(self._identity(), calibrated)
+
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "机制", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._ok_command("0.500000"),
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(judge.main(["accept"], root=self.root), 2)
+        self.assertEqual(
+            [row["commit"] for row in judge.read_parents(self.root / "parents.tsv")],
+            [baseline],
+        )
+
+        scored = [
+            row for row in judge.read_results(self.root / "results.tsv")
+            if row["val_bpb"] != ""
+        ]
+        self.assertTrue(scored)
+        self.assertEqual({row["eval_hash"] for row in scored}, {calibrated})
