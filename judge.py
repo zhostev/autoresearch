@@ -115,17 +115,14 @@ def claim_verdict(
     candidate_seed2: float | None,
     parent_seed1: float | None,
     parent_seed2: float | None,
-    prepare_hashes: list[str],
-    data_hashes: list[str],
+    eval_hashes: list[str],
     min_improvement: float | None,
     n: int,
 ) -> tuple[str, str]:
     if (
-        len(prepare_hashes) != 4
-        or len(set(prepare_hashes)) != 1
-        or len(data_hashes) != 4
-        or len(set(data_hashes)) != 1
-        or any(item == "" for item in prepare_hashes + data_hashes)
+        len(eval_hashes) != 4
+        or len(set(eval_hashes)) != 1
+        or any(item == "" for item in eval_hashes)
     ):
         return "还判不了", "尺子或数据不同"
     missing = []
@@ -140,7 +137,7 @@ def claim_verdict(
     if missing:
         return "还判不了", "缺" + "、".join(missing)
     if min_improvement is None or min_improvement <= 0:
-        return "还判不了", "最小差距未写"
+        return "还判不了", "未标定"
     improvement_1 = parent_seed1 - candidate_seed1
     improvement_2 = parent_seed2 - candidate_seed2
     if improvement_1 == improvement_2 and improvement_1 != 0:
@@ -173,6 +170,32 @@ def rotation_blocked(
         return False
     seen = {row["parent"] for row in window}
     return len(seen) == 1 and head_parent in seen
+
+
+FINAL_CLAIMS = frozenset({"成立", "更差", "没有更好"})
+
+
+def apply_claim(
+    parents: list[dict], commit: str, decision: str, mean: float
+) -> list[dict]:
+    if decision not in FINAL_CLAIMS:
+        return list(parents)
+    if not any(row["commit"] == commit for row in parents):
+        return list(parents)
+    if decision == "更差" and len(parents) > 1:
+        return [row for row in parents if row["commit"] != commit]
+    updated = []
+    for row in parents:
+        if row["commit"] != commit:
+            updated.append(row)
+            continue
+        fresh = dict(row)
+        fresh["reviewed"] = "yes"
+        if decision != "更差":
+            fresh["val_bpb"] = f"{mean:.6f}"
+            fresh["seeds"] = "1,2"
+        updated.append(fresh)
+    return updated
 
 
 def _drop_one(rows: list[dict], newcomer_commit: str) -> dict:
@@ -791,13 +814,20 @@ def cmd_claim(repo: Path) -> int:
         _bpb(slots[2]),
         _bpb(slots[3]),
         [row["eval_hash"] if row else "" for row in slots],
-        [row["eval_hash"] if row else "" for row in slots],
         (read_run(repo) or {}).get("min_improvement"),
         count_n(rows),
     )
     result["decision"] = decision
     result["detail"] = detail
     append_result(repo / "results.tsv", result)
+    if decision in FINAL_CLAIMS:
+        candidate = [_bpb(slots[0]), _bpb(slots[1])]
+        mean = statistics.fmean([item for item in candidate if item is not None])
+        write_parents(
+            repo / "parents.tsv",
+            apply_claim(read_parents(repo / "parents.tsv"), head, decision, mean),
+        )
+        write_queue(repo / "queue.tsv", dequeue(read_queue(repo / "queue.tsv"), head))
     return 0
 
 

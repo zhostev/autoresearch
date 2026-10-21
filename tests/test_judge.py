@@ -28,39 +28,39 @@ class TestClaim(unittest.TestCase):
         ]
         for scores in cases:
             decision, detail = judge.claim_verdict(
-                *scores[:4], hashes, hashes, 0.001, 1
+                *scores[:4], hashes, 0.001, 1
             )
             self.assertEqual(decision, "还判不了")
             self.assertEqual(detail, scores[4])
         decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, hashes, hashes, None, 1
+            0.9, 0.9, 1.0, 1.0, hashes, None, 1
         )
-        self.assertEqual((decision, detail), ("还判不了", "最小差距未写"))
+        self.assertEqual((decision, detail), ("还判不了", "未标定"))
         decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, hashes, hashes, 0.0, 1
+            0.9, 0.9, 1.0, 1.0, hashes, 0.0, 1
         )
-        self.assertEqual((decision, detail), ("还判不了", "最小差距未写"))
+        self.assertEqual((decision, detail), ("还判不了", "未标定"))
         decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, hashes, hashes, -0.1, 1
+            0.9, 0.9, 1.0, 1.0, hashes, -0.1, 1
         )
-        self.assertEqual((decision, detail), ("还判不了", "最小差距未写"))
+        self.assertEqual((decision, detail), ("还判不了", "未标定"))
         decision, detail = judge.claim_verdict(
-            0.9, 0.9, 1.0, 1.0, ["a", "b", "a", "a"], hashes, 0.001, 1
+            0.9, 0.9, 1.0, 1.0, ["a", "b", "a", "a"], 0.001, 1
         )
         self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
         decision, detail = judge.claim_verdict(
-            0.99, 0.99, 1.0, 1.0, hashes, hashes, 0.001, 1
+            0.99, 0.99, 1.0, 1.0, hashes, 0.001, 1
         )
         self.assertEqual((decision, detail), ("还判不了", "两次改进没有分开"))
 
     def test_worse_and_tie(self):
         hashes = ["a", "a", "a", "a"]
         decision, detail = judge.claim_verdict(
-            1.1, 1.2, 1.0, 1.0, hashes, hashes, 0.001, 1
+            1.1, 1.2, 1.0, 1.0, hashes, 0.001, 1
         )
         self.assertEqual(decision, "更差")
         decision, detail = judge.claim_verdict(
-            1.0, 1.0, 1.0, 1.0, hashes, hashes, 0.001, 1
+            1.0, 1.0, 1.0, 1.0, hashes, 0.001, 1
         )
         self.assertEqual(decision, "没有更好")
 
@@ -78,11 +78,11 @@ class TestClaim(unittest.TestCase):
         self.assertAlmostEqual(penalty, 0.007064460135092854, delta=1e-12)
         hashes = ["h", "h", "h", "h"]
         self.assertEqual(
-            judge.claim_verdict(0.990, 0.996, 1.000, 1.002, hashes, hashes, 0.001, 4)[0],
+            judge.claim_verdict(0.990, 0.996, 1.000, 1.002, hashes, 0.001, 4)[0],
             "没有更好",
         )
         self.assertEqual(
-            judge.claim_verdict(0.990, 0.996, 1.000, 1.002, hashes, hashes, 0.0005, 4)[0],
+            judge.claim_verdict(0.990, 0.996, 1.000, 1.002, hashes, 0.0005, 4)[0],
             "成立",
         )
         self.assertEqual(judge.luck_penalty(0.5, 0.6, 1), 0.0)
@@ -1108,3 +1108,81 @@ class TestBackpressure(TestTrial):
         )
         self.assertEqual(code, 0)
         self.assertEqual(judge.read_queue(self.root / "queue.tsv"), [])
+
+
+class TestClaimV2(unittest.TestCase):
+    def _hashes(self):
+        return ["e"] * 4
+
+    def test_one_hash_list_replaces_two(self):
+        decision, detail = judge.claim_verdict(
+            0.9, 0.9, 1.0, 1.0, ["e", "f", "e", "e"], 0.001, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "尺子或数据不同"))
+
+    def test_uncalibrated_says_so(self):
+        decision, detail = judge.claim_verdict(
+            0.9, 0.9, 1.0, 1.0, self._hashes(), None, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "未标定"))
+        decision, detail = judge.claim_verdict(
+            0.9, 0.9, 1.0, 1.0, self._hashes(), 0.0, 1
+        )
+        self.assertEqual((decision, detail), ("还判不了", "未标定"))
+
+    def test_penalty_example_still_holds(self):
+        decision, _ = judge.claim_verdict(
+            0.990, 0.996, 1.000, 1.002, self._hashes(), 0.001, 4
+        )
+        self.assertEqual(decision, "没有更好")
+        decision, _ = judge.claim_verdict(
+            0.990, 0.996, 1.000, 1.002, self._hashes(), 0.0005, 4
+        )
+        self.assertEqual(decision, "成立")
+
+
+class TestClaimSideEffects(unittest.TestCase):
+    def _parents(self):
+        return [
+            {"commit": "a" * 40, "mechanism": "基线", "val_bpb": "1.000000",
+             "seeds": "1,2,3,4,5", "reviewed": "yes", "simpler": "no"},
+            {"commit": "b" * 40, "mechanism": "学习率", "val_bpb": "0.900000",
+             "seeds": "1", "reviewed": "no", "simpler": "no"},
+        ]
+
+    def test_holds_updates_to_the_mean(self):
+        rows = judge.apply_claim(self._parents(), "b" * 40, "成立", 0.905)
+        target = rows[1]
+        self.assertEqual(target["val_bpb"], "0.905000")
+        self.assertEqual(target["seeds"], "1,2")
+        self.assertEqual(target["reviewed"], "yes")
+        self.assertEqual(len(rows), 2)
+
+    def test_no_better_also_updates_and_stays(self):
+        rows = judge.apply_claim(self._parents(), "b" * 40, "没有更好", 0.905)
+        self.assertEqual(rows[1]["reviewed"], "yes")
+        self.assertEqual(len(rows), 2)
+
+    def test_worse_is_removed(self):
+        rows = judge.apply_claim(self._parents(), "b" * 40, "更差", 1.100)
+        self.assertEqual([row["commit"] for row in rows], ["a" * 40])
+
+    def test_worse_never_empties_the_list(self):
+        only = [self._parents()[1]]
+        rows = judge.apply_claim(only, "b" * 40, "更差", 1.100)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reviewed"], "yes")
+
+    def test_not_yet_decidable_never_dequeues(self):
+        queue = [{"commit": "b" * 40, "parent": "a" * 40, "mechanism": "学习率",
+                  "accepted_at": "t", "state": "待复核"}]
+        self.assertNotIn("还判不了", judge.FINAL_CLAIMS)
+        self.assertEqual(judge.dequeue(queue, "z" * 40), queue)
+
+    def test_unknown_commit_changes_nothing(self):
+        before = self._parents()
+        self.assertEqual(judge.apply_claim(before, "z" * 40, "成立", 0.5), before)
+
+    def test_not_yet_decidable_changes_nothing(self):
+        before = self._parents()
+        self.assertEqual(judge.apply_claim(before, "b" * 40, "还判不了", 0.9), before)
