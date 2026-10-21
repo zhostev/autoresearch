@@ -1795,3 +1795,88 @@ class TestTwoRulersAreNeverCompared(TestTrial):
         ]
         self.assertTrue(scored)
         self.assertEqual({row["eval_hash"] for row in scored}, {calibrated})
+
+
+class TestStepBudgetIsEnforced(TestTrial):
+    """步数预算在 task.py 里冻着，但终止条件在 agent 可改的 train.py 里。
+    judge 必须自己核对训练真的跑满了，否则一次提前退出会被记成有效测量。"""
+
+    def _train_printing(self, steps):
+        script = self.root / "fake_train.py"
+        script.write_text(
+            "import os\n"
+            "print('seed: ' + os.environ['AUTORES_SEED'])\n"
+            f"print('num_steps:        {steps}')\n"
+            "print('val_bpb:          0.500000')\n",
+            encoding="utf-8",
+        )
+        return [sys.executable, str(script)]
+
+    def _with_budget(self, budget):
+        (self.root / "task.py").write_text(
+            f"NAME = 'test'\nSTEP_BUDGET = {budget}\n", encoding="utf-8"
+        )
+        self._git("add", "task.py")
+        self._git("commit", "-m", "budget")
+
+    def test_a_short_run_is_a_failed_measurement(self):
+        self._with_budget(100)
+        self._prepare_child()
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._train_printing(93),
+        )
+        self.assertEqual(code, 0)
+        row = judge.read_results(self.root / "results.tsv")[-1]
+        self.assertEqual(row["decision"], "测量失败")
+        self.assertEqual(row["val_bpb"], "")
+        self.assertIn("93", row["detail"])
+
+    def test_a_full_run_is_recorded(self):
+        self._with_budget(100)
+        self._prepare_child()
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._train_printing(100),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            judge.read_results(self.root / "results.tsv")[-1]["decision"], "好于父本"
+        )
+
+    def test_a_task_without_a_step_budget_is_not_checked(self):
+        self._prepare_child()
+        code = self._trial(
+            ["--seed", "1", "--mechanism", "学习率", "--knobs", "",
+             "--expect", "lower", "--fail", "崩了"],
+            command=self._train_printing(7),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            judge.read_results(self.root / "results.tsv")[-1]["decision"], "好于父本"
+        )
+
+
+class TestAuditOnlySearchRows(unittest.TestCase):
+    def _row(self, seed, knobs):
+        return {
+            "commit": "b" * 40, "parent": "a" * 40, "mechanism": "容量",
+            "knobs": knobs, "expect": "lower", "fail": "崩了", "seed": seed,
+            "val_bpb": "0.9", "eval_hash": "e" * 64, "decision": "好于父本",
+            "detail": "",
+        }
+
+    def test_a_reviewed_mechanism_is_not_flagged(self):
+        rows = [self._row("1", "IMAGE_SIZE,WIDTH"), self._row("2", "")]
+        text = judge.build_report(None, rows, [], [])
+        audit = text.split("## 机制审计", 1)[1]
+        self.assertNotIn("容量", audit)
+
+    def test_a_genuinely_inconsistent_mechanism_is_still_flagged(self):
+        rows = [self._row("1", "IMAGE_SIZE"), self._row("1", "BATCH_SIZE")]
+        rows[1]["commit"] = "c" * 40
+        text = judge.build_report(None, rows, [], [])
+        audit = text.split("## 机制审计", 1)[1]
+        self.assertIn("容量", audit)

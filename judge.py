@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
 import hashlib
 import json
@@ -427,7 +428,7 @@ def build_report(
     out += ["", "## 机制审计", ""]
     knobs_by_mechanism: dict[str, set[str]] = {}
     for row in rows:
-        if row["seed"] not in {"1", "2"} or row["mechanism"] == "基线":
+        if row["seed"] != "1" or row["mechanism"] == "基线":
             continue
         knobs_by_mechanism.setdefault(row["mechanism"], set()).add(row["knobs"])
     flagged = {
@@ -469,6 +470,49 @@ def parse_summary(text: str) -> tuple[str | None, str | None]:
             parts = line.split()
             val_bpb = parts[1] if len(parts) > 1 else None
     return seed, val_bpb
+
+
+def step_budget(task_py: Path) -> int | None:
+    """从 task.py 源码里读 STEP_BUDGET，不执行它。任务没声明就返回 None。"""
+    if not task_py.is_file():
+        return None
+    try:
+        tree = ast.parse(task_py.read_text(encoding="utf-8"))
+    except (SyntaxError, OSError, ValueError):
+        return None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "STEP_BUDGET":
+                value = node.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, int):
+                    return value.value
+    return None
+
+
+def parse_steps(text: str) -> int | None:
+    found = None
+    for line in text.splitlines():
+        if line.startswith("num_steps:"):
+            parts = line.split()
+            if len(parts) > 1:
+                try:
+                    found = int(parts[1])
+                except ValueError:
+                    found = None
+    return found
+
+
+def short_run(log_text: str, task_py: Path) -> tuple[int | None, int] | None:
+    """训练没跑满步数预算时返回 (实际步数, 预算)，否则 None。"""
+    budget = step_budget(task_py)
+    if budget is None:
+        return None
+    steps = parse_steps(log_text)
+    if steps is None or steps < budget:
+        return steps, budget
+    return None
 
 
 def file_sha256(path: Path) -> str:
@@ -752,6 +796,12 @@ def main(
         row["decision"] = "测量失败"
         append_result(results_path, row)
         return 0
+    cut = short_run(log_text, task_py)
+    if cut is not None:
+        row["decision"] = "测量失败"
+        row["detail"] = f"只跑了 {cut[0]} 步，预算 {cut[1]} 步"
+        append_result(results_path, row)
+        return 0
     row["val_bpb"] = printed_bpb
     if args.seed == "2":
         row["decision"] = "已记录"
@@ -840,6 +890,14 @@ def cmd_calibrate(
             row["decision"] = "测量失败"
             append_result(results_path, row)
             return refuse(f"标定第 {seed} 次打印的种子不是 {seed}，整次标定作废")
+        cut = short_run(log_text, task_py)
+        if cut is not None:
+            row["decision"] = "测量失败"
+            row["detail"] = f"只跑了 {cut[0]} 步，预算 {cut[1]} 步"
+            append_result(results_path, row)
+            return refuse(
+                f"标定第 {seed} 次只跑了 {cut[0]}/{cut[1]} 步，整次标定作废"
+            )
         row["val_bpb"] = printed_bpb
         row["decision"] = "基线"
         append_result(results_path, row)
