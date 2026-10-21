@@ -1,3 +1,4 @@
+import sys
 import unittest
 from pathlib import Path
 
@@ -229,27 +230,6 @@ class TestParse(unittest.TestCase):
     def test_missing_lines(self):
         self.assertEqual(judge.parse_summary("no summary\n"), (None, None))
 
-    def test_data_hash_uses_sizes_not_bytes(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            token_dir = root / "tokenizer"
-            token_dir.mkdir()
-            tokenizer = token_dir / "tokenizer.pkl"
-            tokenizer.write_bytes(b"abc")
-            data = root / "data"
-            data.mkdir()
-            val = data / "shard_06542.parquet"
-            val.write_bytes(b"12345")
-            (data / "shard_00001.parquet").write_bytes(b"z")
-            first = judge.data_hash(tokenizer, val, data)
-            val.write_bytes(b"1234")
-            second = judge.data_hash(tokenizer, val, data)
-            self.assertIsNotNone(first)
-            self.assertNotEqual(first, second)
-            self.assertIsNone(judge.data_hash(tokenizer, root / "missing.parquet", data))
-
 
 def git_head(root: Path) -> str:
     import subprocess
@@ -271,12 +251,13 @@ class TestTrial(unittest.TestCase):
         (self.root / "prepare.py").write_text("TIME_BUDGET = 300\n", encoding="utf-8")
         (self.root / "train.py").write_text("print('train')\n", encoding="utf-8")
         (self.root / "judge.py").write_text("# test copy\n", encoding="utf-8")
+        (self.root / "task.py").write_text("NAME = 'test'\n", encoding="utf-8")
         data = self.root / "data"
         data.mkdir()
         (data / "shard_06542.parquet").write_bytes(b"val")
         (data / "shard_00001.parquet").write_bytes(b"train")
         (self.root / "tokenizer.pkl").write_bytes(b"tok")
-        self._git("add", "prepare.py", "train.py", "judge.py")
+        self._git("add", "prepare.py", "train.py", "judge.py", "task.py")
         self._git("commit", "-m", "base")
 
     def tearDown(self):
@@ -295,6 +276,21 @@ class TestTrial(unittest.TestCase):
             root=self.root,
         )
 
+    def _identity(self):
+        return judge.eval_hash(
+            self.root / "task.py", self.root / "prepare.py", self.root / "data"
+        )
+
+    def _ok_command(self, value):
+        script = self.root / "ok_train.py"
+        script.write_text(
+            "import os\n"
+            "print('seed: ' + os.environ['AUTORES_SEED'])\n"
+            f"print('val_bpb:          {value}')\n",
+            encoding="utf-8",
+        )
+        return [sys.executable, str(script)]
+
     def _done_row(self, mechanism, seed, decision="好于父本", val="1.000000"):
         return {
             "commit": git_head(self.root),
@@ -303,9 +299,9 @@ class TestTrial(unittest.TestCase):
             "expect": "lower",
             "fail": "崩了",
             "seed": seed,
+            "knobs": "",
             "val_bpb": val,
-            "prepare_hash": "p",
-            "data_hash": "d",
+            "eval_hash": self._identity(),
             "decision": decision,
             "detail": "",
         }
@@ -612,3 +608,62 @@ class TestInstructions(unittest.TestCase):
         self.assertIn("results.tsv", ignored)
         self.assertIn("parents.tsv", ignored)
         self.assertIn("run.log", ignored)
+
+
+class TestEvalHash(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "task.py").write_text("NAME = 'x'\n", encoding="utf-8")
+        (self.root / "prepare.py").write_text("TIME_BUDGET = 300\n", encoding="utf-8")
+        self.data = self.root / "data"
+        (self.data / "sub").mkdir(parents=True)
+        (self.data / "a.parquet").write_bytes(b"aaa")
+        (self.data / "sub" / "b.parquet").write_bytes(b"bb")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _hash(self):
+        return judge.eval_hash(
+            self.root / "task.py", self.root / "prepare.py", self.data
+        )
+
+    def test_manifest_lists_relative_paths_and_sizes(self):
+        self.assertEqual(
+            judge.data_manifest(self.data), "a.parquet 3\nsub/b.parquet 2\n"
+        )
+
+    def test_hash_is_stable(self):
+        self.assertEqual(self._hash(), self._hash())
+
+    def test_task_py_byte_changes_the_hash(self):
+        before = self._hash()
+        (self.root / "task.py").write_text("NAME = 'y'\n", encoding="utf-8")
+        self.assertNotEqual(before, self._hash())
+
+    def test_new_data_file_changes_the_hash(self):
+        before = self._hash()
+        (self.data / "c.parquet").write_bytes(b"c")
+        self.assertNotEqual(before, self._hash())
+
+    def test_content_change_at_same_size_does_not_change_the_hash(self):
+        before = self._hash()
+        (self.data / "a.parquet").write_bytes(b"zzz")
+        self.assertEqual(before, self._hash())
+
+    def test_missing_data_root_is_unavailable(self):
+        import shutil
+
+        shutil.rmtree(self.data)
+        self.assertIsNone(judge.data_manifest(self.data))
+        self.assertIsNone(self._hash())
+
+    def test_symlink_and_directory_entries_are_skipped(self):
+        (self.data / "link.parquet").symlink_to(self.data / "a.parquet")
+        (self.data / "emptydir").mkdir()
+        self.assertEqual(
+            judge.data_manifest(self.data), "a.parquet 3\nsub/b.parquet 2\n"
+        )

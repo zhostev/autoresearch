@@ -133,8 +133,8 @@ def apply_accept(
 
 
 RESULT_HEADER = (
-    "commit\tparent\tmechanism\texpect\tfail\tseed\tval_bpb\t"
-    "prepare_hash\tdata_hash\tdecision\tdetail"
+    "commit\tparent\tmechanism\tknobs\texpect\tfail\tseed\tval_bpb\t"
+    "eval_hash\tdecision\tdetail"
 )
 PARENT_HEADER = "commit\tmechanism\tval_bpb\tsimpler"
 RESULT_FIELDS = RESULT_HEADER.split("\t")
@@ -224,33 +224,38 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def data_hash(tokenizer_path: Path, val_path: Path, data_dir: Path) -> str | None:
-    if not tokenizer_path.is_file() or not val_path.is_file() or not data_dir.is_dir():
+def data_manifest(data_root: Path) -> str | None:
+    if not data_root.is_dir():
         return None
-    lines = [
-        f"tokenizer.pkl {tokenizer_path.stat().st_size}",
-        f"shard_06542.parquet {val_path.stat().st_size}",
-    ]
-    for path in sorted(data_dir.glob("*.parquet")):
-        lines.append(f"{path.name} {path.stat().st_size}")
+    entries = []
+    for path in data_root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        entries.append((path.relative_to(data_root).as_posix(), path.stat().st_size))
+    entries.sort(key=lambda item: item[0])
+    return "".join(f"{name} {size}\n" for name, size in entries)
+
+
+def eval_hash(task_py: Path, prepare_py: Path, data_root: Path) -> str | None:
+    if not task_py.is_file() or not prepare_py.is_file():
+        return None
+    manifest = data_manifest(data_root)
+    if manifest is None:
+        return None
+    payload = file_sha256(task_py) + "\n" + file_sha256(prepare_py) + "\n" + manifest
     digest = hashlib.sha256()
-    digest.update(("\n".join(lines) + "\n").encode("utf-8"))
+    digest.update(payload.encode("utf-8"))
     return digest.hexdigest()
 
 
-def trial_paths(root: Path) -> tuple[Path, Path, Path]:
-    data_dir = root / "data"
-    return root / "tokenizer.pkl", data_dir / "shard_06542.parquet", data_dir
+def eval_paths(repo: Path, test_root: bool) -> tuple[Path, Path, Path]:
+    task_py = repo / "task.py"
+    prepare_py = repo / "prepare.py"
+    if test_root:
+        return task_py, prepare_py, repo / "data"
+    from task import DATA_ROOT
 
-
-def production_paths() -> tuple[Path, Path, Path]:
-    from prepare import DATA_DIR, TOKENIZER_DIR, VAL_FILENAME
-
-    return (
-        Path(TOKENIZER_DIR) / "tokenizer.pkl",
-        Path(DATA_DIR) / VAL_FILENAME,
-        Path(DATA_DIR),
-    )
+    return task_py, prepare_py, Path(DATA_ROOT)
 
 
 def git_output(root: Path, *args: str) -> str | None:
@@ -264,7 +269,8 @@ def git_output(root: Path, *args: str) -> str | None:
 
 def is_dirty(root: Path) -> bool:
     completed = subprocess.run(
-        ["git", "status", "--porcelain", "--", "train.py", "prepare.py", "judge.py"],
+        ["git", "status", "--porcelain", "--",
+         "train.py", "prepare.py", "judge.py", "task.py"],
         cwd=root, capture_output=True, text=True,
     )
     return completed.returncode != 0 or completed.stdout.strip() != ""
@@ -368,9 +374,8 @@ def main(
         ]
         if not parent_scores:
             return 2
-    tokenizer, val, data_dir = trial_paths(repo) if root is not None else production_paths()
-    prepare_hash = file_sha256(repo / "prepare.py")
-    identity = data_hash(tokenizer, val, data_dir)
+    task_py, prepare_py, data_root = eval_paths(repo, root is not None)
+    identity = eval_hash(task_py, prepare_py, data_root)
     row = blank_row()
     row.update({
         "commit": head,
@@ -379,14 +384,13 @@ def main(
         "expect": args.expect,
         "fail": args.fail,
         "seed": args.seed,
-        "prepare_hash": prepare_hash,
     })
     if identity is None:
         row["decision"] = "代码坏了"
         row["detail"] = "数据身份不可用"
         append_result(results_path, row)
         return 0
-    row["data_hash"] = identity
+    row["eval_hash"] = identity
     code = run_command(train, args.seed, repo / "run.log", timeout)
     log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
     printed_seed, printed_bpb = parse_summary(log_text)
@@ -447,7 +451,7 @@ def cmd_baseline(repo: Path, command: list[str], timeout: float, test_root: bool
         return 0
     if existing:
         return 2
-    tokenizer, val, data_dir = trial_paths(repo) if test_root else production_paths()
+    task_py, prepare_py, data_root = eval_paths(repo, test_root)
     row = blank_row()
     row.update({
         "commit": head,
@@ -456,15 +460,14 @@ def cmd_baseline(repo: Path, command: list[str], timeout: float, test_root: bool
         "expect": "lower",
         "fail": "基线",
         "seed": "1",
-        "prepare_hash": file_sha256(repo / "prepare.py"),
     })
-    identity = data_hash(tokenizer, val, data_dir)
+    identity = eval_hash(task_py, prepare_py, data_root)
     if identity is None:
         row["decision"] = "代码坏了"
         row["detail"] = "数据身份不可用"
         append_result(results_path, row)
         return 0
-    row["data_hash"] = identity
+    row["eval_hash"] = identity
     code = run_command(command, "1", repo / "run.log", timeout)
     log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
     printed_seed, printed_bpb = parse_summary(log_text)
@@ -524,8 +527,8 @@ def cmd_accept(repo: Path, simpler: bool, replace_commit: str | None) -> int:
         "expect": seed1["expect"],
         "fail": seed1["fail"],
         "seed": "*",
-        "prepare_hash": seed1["prepare_hash"],
-        "data_hash": seed1["data_hash"],
+        "knobs": seed1["knobs"],
+        "eval_hash": seed1["eval_hash"],
         "decision": decision,
         "detail": detail,
     })
@@ -569,8 +572,8 @@ def cmd_claim(repo: Path) -> int:
         _bpb(slots[1]),
         _bpb(slots[2]),
         _bpb(slots[3]),
-        [row["prepare_hash"] if row else "" for row in slots],
-        [row["data_hash"] if row else "" for row in slots],
+        [row["eval_hash"] if row else "" for row in slots],
+        [row["eval_hash"] if row else "" for row in slots],
         MIN_IMPROVEMENT,
         count_n(rows),
     )
