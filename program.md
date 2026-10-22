@@ -121,11 +121,19 @@ Then, on the candidate commit, run:
 uv run judge.py claim
 ```
 
-`claim` pools every seed each side was measured at -- not just the first two --
-and its threshold is the accept band raised to `min_improvement` and then
-widened by a luck penalty for the number of mechanisms tried, so it is always
-stricter than the band that let the commit into the list. Its detail column
-records how many measurements each arm contributed.
+Both gates size their band from each arm's own noise rather than assuming the
+two share one. A mechanism can be noisier than the baseline it came from --
+two that are quiet alone have combined into one with more than twice the
+spread -- and a band built on the baseline's sigma alone would wave that
+through.
+
+`claim` pools every seed each side was measured at, not just the first two.
+Its threshold is `(z + sqrt(2 ln N))` standard errors, where N counts the
+mechanisms tried: always wider than the `z` standard errors accept used, so
+claim is stricter by construction, yet it narrows as either arm is measured
+more, so extra seeds buy real sensitivity. `min_improvement` is a separate
+gate -- the smallest gain a human cares about, which may be zero. The detail
+column records how many measurements each arm contributed.
 
 Only a `claim` row whose decision is `成立` is a validated result. `还判不了` means the materials were insufficient. `进入名单` is not that result.
 

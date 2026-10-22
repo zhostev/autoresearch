@@ -66,11 +66,46 @@ def write_run(repo: Path, config: dict) -> None:
     os.replace(temporary, path)
 
 
-def band_for(sigma: float, z: float, n: int, m: int = 1) -> float:
-    """候选 m 次、父本 n 次时，两个均值之差的判定带。"""
-    parent = n if n >= 1 else 1
+def arm_sigma(samples: list[float], calibrated: float) -> float:
+    """一臂的噪声估计。
+
+    少于两个样本就只能用标定值。有两个以上时取观测与标定的较大者：
+    三个样本看着安静往往只是抽样不足，看着吵一定是真吵。σ 是配置的属性
+    而不是全局常数——同一基线上，两个机制单独用的 sd 都在 3 张左右，
+    合起来能跳到 7-9 张。
+    """
+    if len(samples) < 2:
+        return calibrated
+    return max(statistics.stdev(samples), calibrated)
+
+
+def band_for(
+    sigma_candidate: float, sigma_parent: float, z: float, m: int = 1, n: int = 1
+) -> float:
+    """两个均值之差的判定带。两臂各用自己的噪声，不假设同方差。"""
+    return z * standard_error(sigma_candidate, sigma_parent, m, n)
+
+
+def standard_error(
+    sigma_candidate: float, sigma_parent: float, m: int, n: int
+) -> float:
     candidate = m if m >= 1 else 1
-    return z * sigma * math.sqrt(1.0 / candidate + 1.0 / parent)
+    parent = n if n >= 1 else 1
+    return math.sqrt(
+        sigma_candidate ** 2 / candidate + sigma_parent ** 2 / parent
+    )
+
+
+def claim_threshold(
+    sigma_candidate: float, sigma_parent: float, z: float, m: int, n: int, n_mech: int
+) -> float:
+    """终局门槛：把多重比较做成标准误的倍数，而不是一个固定偏移。
+
+    固定偏移不随样本数缩小，会让「多测几次」对 claim 毫无用处。写成倍数后，
+    门槛随样本数下降、随已试机制数上升，并且恒大于 accept 用的 z·SE。
+    """
+    crowd = math.sqrt(2.0 * math.log(max(n_mech, 2)))
+    return (z + crowd) * standard_error(sigma_candidate, sigma_parent, m, n)
 
 COUNTED_DECISIONS = frozenset({
     "好于父本",
@@ -123,18 +158,16 @@ def claim_verdict(
     eval_hashes: list[str],
     sigma: float | None,
     z: float,
-    min_improvement: float | None,
-    n: int,
+    policy_floor: float | None,
+    n_mech: int,
 ) -> tuple[str, str]:
-    """终局判定。两臂各用自己全部样本的均值，门槛恒严于 accept 的带宽。
+    """终局判定。两道独立的闸：统计门槛，和人设的政策下限。
 
-    门槛 = max(band, min_improvement) + 碰运气扣减。
-    claim 要求两臂各至少 2 个样本，所以 band = z·σ·√(1/m+1/n) ≤ z·σ，
-    而 calibrate 写入的 min_improvement 正是 z·σ，因此门槛永远不低于
-    min_improvement，也永远高于 accept 用的那条带宽。
+    统计门槛 = (z + √(2 ln N)) · SE，SE 按两臂各自的噪声算。它恒大于 accept
+    用的 z·SE，所以 claim 永远严于 accept；同时它随样本数缩小，所以多测
+    几次真的能换来灵敏度。
 
-    扣减用标定的 σ，不用候选自己那两三个样本的标准差：错误率是离散的，
-    两个种子很容易给出同一个分数，σ_cand 会退化成 0 让扣减失效。
+    政策下限是「人不关心小于这个幅度的改进」，与统计无关，可以是 0。
     """
     if len(candidate) < 2:
         return "还判不了", "缺候选样本"
@@ -146,17 +179,20 @@ def claim_verdict(
         or any(item == "" for item in eval_hashes)
     ):
         return "还判不了", "尺子或数据不同"
-    if sigma is None or sigma <= 0 or min_improvement is None or min_improvement <= 0:
+    if sigma is None or sigma <= 0:
         return "还判不了", "未标定"
     improvement = statistics.fmean(parent) - statistics.fmean(candidate)
     if improvement < 0:
         return "更差", ""
-    band = band_for(sigma, z, len(parent), len(candidate))
-    penalty = sigma * math.sqrt(2.0 * math.log(n)) if n > 1 else 0.0
-    threshold = max(band, min_improvement) + penalty
-    if improvement > threshold:
-        return "成立", ""
-    return "没有更好", ""
+    threshold = claim_threshold(
+        arm_sigma(candidate, sigma), arm_sigma(parent, sigma),
+        z, len(candidate), len(parent), n_mech,
+    )
+    if improvement <= threshold:
+        return "没有更好", ""
+    if policy_floor is not None and improvement <= policy_floor:
+        return "没有更好", ""
+    return "成立", ""
 
 
 ATTEMPT_DECISIONS = frozenset({
@@ -384,7 +420,8 @@ def build_report(
         out.append(f"- R = {config['repeats']}，Z = {config['z']}")
         out.append(f"- σ = {config['sigma']:.6f}")
         out.append(
-            f"- band（新父本）= {band_for(config['sigma'], config['z'], 1):.6f}"
+            f"- band（两臂各一次、均为标定噪声）= "
+            f"{band_for(config['sigma'], config['sigma'], config['z'], 1, 1):.6f}"
         )
         out.append(f"- min_improvement = {config['min_improvement']:.6f}")
         out.append(
@@ -870,7 +907,14 @@ def main(
             append_result(results_path, extra)
             samples.append(float(got_bpb))
     mean = statistics.fmean(samples)
-    band = band_for(config["sigma"], config["z"], n_parent, len(samples))
+    parent_samples = list(sample_scores(rows, parent_commit).values())
+    band = band_for(
+        arm_sigma(samples, config["sigma"]),
+        arm_sigma(parent_samples, config["sigma"]),
+        config["z"],
+        len(samples),
+        n_parent,
+    )
     row["decision"] = compare_to_parent(mean, parent_bpb, band)
     if len(samples) > 1:
         row["detail"] = f"{len(samples)} 次均值 {mean:.6f}"
@@ -1095,7 +1139,7 @@ def cmd_claim(repo: Path, test_root: bool) -> int:
         [row["eval_hash"] for row in used],
         config["sigma"],
         config["z"],
-        config["min_improvement"],
+        config.get("min_improvement", 0.0),
         count_n(rows),
     )
     result["decision"] = decision

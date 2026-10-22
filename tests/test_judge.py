@@ -663,20 +663,20 @@ class TestRunConfig(unittest.TestCase):
 
     def test_band_widens_as_the_parent_gets_noisier(self):
         self.assertAlmostEqual(
-            judge.band_for(0.004, 2.0, 1), 2.0 * 0.004 * math.sqrt(2.0), places=12
+            judge.band_for(0.004, 0.004, 2.0, 1, 1), 2.0 * 0.004 * math.sqrt(2.0), places=12
         )
         self.assertAlmostEqual(
-            judge.band_for(0.004, 2.0, 2), 2.0 * 0.004 * math.sqrt(1.5), places=12
+            judge.band_for(0.004, 0.004, 2.0, 1, 2), 2.0 * 0.004 * math.sqrt(1.5), places=12
         )
         self.assertAlmostEqual(
-            judge.band_for(0.004, 2.0, 5), 2.0 * 0.004 * math.sqrt(1.2), places=12
+            judge.band_for(0.004, 0.004, 2.0, 1, 5), 2.0 * 0.004 * math.sqrt(1.2), places=12
         )
-        self.assertGreater(judge.band_for(0.004, 2.0, 1), judge.band_for(0.004, 2.0, 5))
+        self.assertGreater(judge.band_for(0.004, 0.004, 2.0, 1, 1), judge.band_for(0.004, 0.004, 2.0, 1, 5))
 
     def test_band_falls_back_to_one_sample_on_bad_n(self):
-        expected = judge.band_for(0.004, 2.0, 1)
-        self.assertEqual(judge.band_for(0.004, 2.0, 0), expected)
-        self.assertEqual(judge.band_for(0.004, 2.0, -3), expected)
+        expected = judge.band_for(0.004, 0.004, 2.0, 1, 1)
+        self.assertEqual(judge.band_for(0.004, 0.004, 2.0, 1, 0), expected)
+        self.assertEqual(judge.band_for(0.004, 0.004, 2.0, 1, -3), expected)
 
 
 class TestCalibrate(TestTrial):
@@ -757,7 +757,7 @@ class TestCalibrate(TestTrial):
 
 class TestNoiseBand(unittest.TestCase):
     def test_band_edges_are_indistinguishable(self):
-        band = judge.band_for(0.004, 2.0, 1)
+        band = judge.band_for(0.004, 0.004, 2.0, 1, 1)
         self.assertEqual(judge.compare_to_parent(1.0 - band - 1e-9, 1.0, band), "好于父本")
         self.assertEqual(judge.compare_to_parent(1.0 - band, 1.0, band), "分不开")
         self.assertEqual(judge.compare_to_parent(1.0, 1.0, band), "分不开")
@@ -765,11 +765,11 @@ class TestNoiseBand(unittest.TestCase):
         self.assertEqual(judge.compare_to_parent(1.0 + band + 1e-9, 1.0, band), "差于父本")
 
     def test_flower14_champion_is_indistinguishable(self):
-        band = judge.band_for(0.0005, 2.0, 1)
+        band = judge.band_for(0.0005, 0.0005, 2.0, 1, 1)
         self.assertEqual(judge.compare_to_parent(0.048064, 0.049399, band), "分不开")
 
     def test_a_real_gain_still_wins(self):
-        band = judge.band_for(0.0005, 2.0, 1)
+        band = judge.band_for(0.0005, 0.0005, 2.0, 1, 1)
         self.assertEqual(judge.compare_to_parent(0.048064, 0.132844, band), "好于父本")
 
     def test_parent_n_counts_the_seed_list(self):
@@ -1768,8 +1768,8 @@ class TestAuditOnlySearchRows(unittest.TestCase):
 
 class TestBandAcrossBothArms(unittest.TestCase):
     def test_more_candidate_samples_tighten_the_band(self):
-        one = judge.band_for(0.004, 2.0, 5)
-        three = judge.band_for(0.004, 2.0, 5, 3)
+        one = judge.band_for(0.004, 0.004, 2.0, 1, 5)
+        three = judge.band_for(0.004, 0.004, 2.0, 3, 5)
         self.assertAlmostEqual(one, 2.0 * 0.004 * math.sqrt(1.0 + 1.0 / 5), places=12)
         self.assertAlmostEqual(
             three, 2.0 * 0.004 * math.sqrt(1.0 / 3 + 1.0 / 5), places=12
@@ -1777,11 +1777,11 @@ class TestBandAcrossBothArms(unittest.TestCase):
         self.assertLess(three, one)
 
     def test_one_candidate_sample_is_the_old_behaviour(self):
-        self.assertEqual(judge.band_for(0.004, 2.0, 2, 1), judge.band_for(0.004, 2.0, 2))
+        self.assertEqual(judge.band_for(0.004, 0.004, 2.0, 1, 2), judge.band_for(0.004, 0.004, 2.0, 1, 2))
 
     def test_bad_counts_fall_back_to_one(self):
-        expected = judge.band_for(0.004, 2.0, 1, 1)
-        self.assertEqual(judge.band_for(0.004, 2.0, 0, 0), expected)
+        expected = judge.band_for(0.004, 0.004, 2.0, 1, 1)
+        self.assertEqual(judge.band_for(0.004, 0.004, 2.0, 0, 0), expected)
 
 
 class TestEscalation(TestTrial):
@@ -1913,7 +1913,7 @@ class TestClaimUsesEverySample(unittest.TestCase):
         sigma, z = 0.004, 2.0
         candidate = [0.9900, 0.9910, 0.9890]
         parent = [1.0000, 1.0010, 0.9990, 1.0005, 0.9995]
-        band = judge.band_for(sigma, z, len(parent), len(candidate))
+        band = judge.band_for(sigma, sigma, z, len(candidate), len(parent))
         improvement = statistics.fmean(parent) - statistics.fmean(candidate)
         # accept 会放行：改进超过带宽。
         self.assertGreater(improvement, band)
@@ -1929,10 +1929,12 @@ class TestClaimUsesEverySample(unittest.TestCase):
         )
         self.assertEqual(decision, "没有更好")
 
-    def test_the_luck_penalty_still_bites(self):
-        args = ([0.980, 0.982, 0.978], [1.000, 1.001, 0.999, 1.002, 0.998],
+    def test_more_mechanisms_tried_raise_the_bar(self):
+        # 改进固定在 0.012，SE 约 0.00292。N=2 时门槛 0.0093 判成立；
+        # N=400 时门槛 0.0160，同一个改进就不够了。
+        args = ([0.988, 0.990, 0.986], [1.000, 1.001, 0.999, 1.002, 0.998],
                 self._hashes(8), 0.004, 2.0, 0.008)
-        self.assertEqual(judge.claim_verdict(*args, 1)[0], "成立")
+        self.assertEqual(judge.claim_verdict(*args, 2)[0], "成立")
         self.assertEqual(judge.claim_verdict(*args, 400)[0], "没有更好")
 
     def test_identical_candidate_scores_no_longer_block(self):
@@ -1984,3 +1986,102 @@ class TestStopRuleIsFrozen(unittest.TestCase):
         self.assertIn("should_stop(", text)
         self.assertNotIn("elapsed >= TIME_BUDGET", text)
         self.assertNotIn("* TIME_BUDGET:", text)
+
+
+class TestPerArmNoise(unittest.TestCase):
+    """缺陷 7：σ 是配置的属性，两臂不能假设同方差。"""
+
+    def test_a_quiet_arm_never_goes_below_the_calibration(self):
+        # 三个样本看着安静往往只是抽样不足。
+        self.assertEqual(judge.arm_sigma([1.0, 1.0, 1.0], 0.004), 0.004)
+        self.assertEqual(judge.arm_sigma([1.000, 1.001], 0.004), 0.004)
+
+    def test_a_noisy_arm_is_believed(self):
+        samples = [0.990, 0.998, 1.012]
+        self.assertAlmostEqual(
+            judge.arm_sigma(samples, 0.004), statistics.stdev(samples), places=12
+        )
+
+    def test_one_sample_falls_back_to_the_calibration(self):
+        self.assertEqual(judge.arm_sigma([1.0], 0.004), 0.004)
+        self.assertEqual(judge.arm_sigma([], 0.004), 0.004)
+
+    def test_the_band_uses_each_arm_separately(self):
+        band = judge.band_for(0.008, 0.002, 2.0, 3, 5)
+        expected = 2.0 * math.sqrt(0.008**2 / 3 + 0.002**2 / 5)
+        self.assertAlmostEqual(band, expected, places=12)
+
+    def test_equal_sigmas_reproduce_the_old_formula(self):
+        band = judge.band_for(0.004, 0.004, 2.0, 3, 5)
+        expected = 2.0 * 0.004 * math.sqrt(1.0 / 3 + 1.0 / 5)
+        self.assertAlmostEqual(band, expected, places=12)
+
+    def test_the_night_two_accept_flips_to_indistinguishable(self):
+        # 候选 65/78/67（sd 7.0 张）对父本 72..80（sd 3.16 张），改进 6.0 张。
+        # 假设同方差时 band 4.62 张 → 好于父本；按各自方差 band 8.56 张 → 分不开。
+        cand = [65 / 1498, 78 / 1498, 67 / 1498]
+        parent = [n / 1498 for n in (72, 74, 76, 78, 80)]
+        calibrated = 3.16 / 1498
+        band = judge.band_for(
+            judge.arm_sigma(cand, calibrated), judge.arm_sigma(parent, calibrated),
+            2.0, len(cand), len(parent),
+        )
+        self.assertGreater(band * 1498, 8.0)
+        self.assertEqual(
+            judge.compare_to_parent(
+                statistics.fmean(cand), statistics.fmean(parent), band
+            ),
+            "分不开",
+        )
+
+
+class TestSelectionScalesTheError(unittest.TestCase):
+    """缺陷 8：扣减原本是固定偏移，不随样本数缩小，使多测样本对 claim 无用。"""
+
+    def _args(self, cand, parent, n):
+        return (cand, parent, ["e"] * (len(cand) + len(parent)), 0.004, 2.0, 0.0, n)
+
+    def test_more_samples_lower_the_threshold(self):
+        few = judge.claim_threshold(0.004, 0.004, 2.0, 2, 2, 4)
+        many = judge.claim_threshold(0.004, 0.004, 2.0, 10, 10, 4)
+        self.assertLess(many, few)
+
+    def test_more_mechanisms_raise_the_threshold(self):
+        quiet = judge.claim_threshold(0.004, 0.004, 2.0, 3, 5, 2)
+        crowded = judge.claim_threshold(0.004, 0.004, 2.0, 3, 5, 400)
+        self.assertGreater(crowded, quiet)
+
+    def test_the_threshold_always_exceeds_the_accept_band(self):
+        for m in (2, 3, 10):
+            for n in (2, 5, 10):
+                for mech in (1, 2, 50):
+                    band = judge.band_for(0.004, 0.004, 2.0, m, n)
+                    thr = judge.claim_threshold(0.004, 0.004, 2.0, m, n, mech)
+                    self.assertGreater(thr, band, f"m={m} n={n} N={mech}")
+
+    def test_a_real_gain_can_now_be_certified(self):
+        # 改进 10 张，两臂都安静：旧规则门槛 11.6 张判不成立，新规则 8.5 张判成立。
+        cand = [(76 - 10) / 1498] * 3
+        parent = [n / 1498 for n in (72, 74, 76, 78, 80)]
+        decision, _ = judge.claim_verdict(
+            cand, parent, ["e"] * 8, 3.16 / 1498, 2.0, 0.0, 4
+        )
+        self.assertEqual(decision, "成立")
+
+    def test_the_policy_floor_is_a_separate_gate(self):
+        cand = [(76 - 10) / 1498] * 3
+        parent = [n / 1498 for n in (72, 74, 76, 78, 80)]
+        # 统计上够了，但人设的政策下限是 20 张 —— 仍然不成立。
+        decision, detail = judge.claim_verdict(
+            cand, parent, ["e"] * 8, 3.16 / 1498, 2.0, 20.0 / 1498, 4
+        )
+        self.assertEqual(decision, "没有更好")
+
+    def test_a_zero_floor_is_a_valid_policy(self):
+        cand = [(76 - 10) / 1498] * 3
+        parent = [n / 1498 for n in (72, 74, 76, 78, 80)]
+        decision, detail = judge.claim_verdict(
+            cand, parent, ["e"] * 8, 3.16 / 1498, 2.0, 0.0, 4
+        )
+        self.assertNotEqual(detail, "未标定")
+        self.assertEqual(decision, "成立")
