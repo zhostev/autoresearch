@@ -2113,3 +2113,41 @@ class TestOverrunProjection(unittest.TestCase):
         rate = 542.5 / 9990
         self.assertTrue(judge.will_overrun(1000, rate * 1000, 10200, 540.0))
         self.assertLess(rate * 1000, 540.0 / 9)
+
+
+class TestReviewNeedsNoExtraSeed(TestTrial):
+    """缺陷 10：追加测量上线后，被 accept 的提交必然已有 seed 1/2/3，
+    所以循环里那一步「先跑 seed 2 再 claim」注定被当成重复而拒绝。"""
+
+    def test_an_accepted_commit_already_has_its_review_seeds(self):
+        parent = self._prepare_child()
+        head = git_head(self.root)
+        for seed, val in (("2", "0.902000"), ("3", "0.898000")):
+            row = self._done_row("学习率", seed, "已记录", val)
+            row["commit"] = head
+            judge.append_result(self.root / "results.tsv", row)
+        win = self._done_row("学习率", "1", "好于父本", "0.900000")
+        win["commit"] = head
+        win["parent"] = parent
+        judge.append_result(self.root / "results.tsv", win)
+        self.assertEqual(judge.main(["accept"], root=self.root), 0)
+        # 这一步是 program.md 原本教的做法，它必然被拒。
+        code = self._trial(
+            ["--seed", "2", "--mechanism", "学习率",
+             "--expect", "lower", "--fail", "崩了"],
+            command=["true"],
+        )
+        self.assertEqual(code, 2)
+        # 材料本来就齐，claim 可以直接跑。
+        self.assertEqual(
+            len(judge.sample_scores(
+                judge.read_results(self.root / "results.tsv"), head)),
+            3,
+        )
+
+
+class TestInstructionsSendReviewStraightToClaim(unittest.TestCase):
+    def test_the_loop_no_longer_prescribes_a_redundant_seed_two(self):
+        text = Path("program.md").read_text(encoding="utf-8")
+        self.assertNotIn("run `trial --seed 2` with the same short mechanism name", text)
+        self.assertIn("judge.py claim", text)

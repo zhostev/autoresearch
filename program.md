@@ -106,9 +106,12 @@ uv run judge.py trial --seed 1 --mechanism 学习率 --knobs LEARNING_RATE \
 11. If the decision is `测量失败`, do not accept the commit. Reset and fix the
     seed printing before counting the idea.
 12. When `queue.tsv` is not empty, pick an entry and review it: check out that
-    commit, run `trial --seed 2` with the same short mechanism name, then run
-    `uv run judge.py claim` on it. A review also replaces that parent's
-    single-seed basis with the mean of its two seeds.
+    commit and run `uv run judge.py claim`. A winning trial had to beat its
+    parent to be accepted, and beating it triggered the extra measurements, so
+    an accepted commit already carries seeds 1 through 3 — running
+    `trial --seed 2` on it now is refused as a duplicate. Only measure another
+    seed if `claim` says it lacks samples. A review also replaces that parent's
+    single-draw basis with the mean of every seed it was measured at.
 
 Overnight search uses seed 1 only. The parent list holds at most three commits.
 
@@ -123,10 +126,13 @@ it on demand.
 
 ## Morning claim
 
-Pick one or two commits you might call validated. For the parent and then the candidate, check out that commit with a clean tree and run:
+Pick one or two commits you might call validated. Both arms usually already
+carry the seeds they need — the candidate from the extra measurements its win
+triggered, the baseline from `calibrate`. Measure another seed only on an arm
+that is short, with a clean tree:
 
 ```text
-uv run judge.py trial --seed 2 --mechanism <same short name> --expect lower --fail <same failure sentence>
+uv run judge.py trial --seed <n> --mechanism <same short name> --expect lower --fail <same failure sentence>
 ```
 
 Then compare the two arms on their shared seeds:
