@@ -517,6 +517,28 @@ def parse_summary(text: str) -> tuple[str | None, str | None]:
     return seed, val_bpb
 
 
+def will_overrun(
+    step: int,
+    elapsed: float,
+    step_budget: int,
+    hard_seconds: float,
+    probe_steps: int = 1000,
+) -> bool:
+    """按当前速率投影，这次训练是否注定跑不完步数预算。
+
+    步数预算与墙钟上限是两条互不知情的约束。没有投影时，一个超出算力的配置
+    要烧满整个墙钟才被发现跑不完步数——一次约九分钟，而且每个贴着上限的机制
+    都要交一次这笔学费。跑够 probe_steps 让速率稳定之后，投影把这笔学费压到
+    一分钟以内；判定仍是 `测量失败`，只是来得早得多。
+
+    task.py 的 should_stop 调它。放在这里是因为预算的执行是 harness 的政策，
+    task.py 只提供参数。
+    """
+    if step < probe_steps or step <= 0:
+        return False
+    return elapsed / step * step_budget > hard_seconds
+
+
 def step_budget(task_py: Path) -> int | None:
     """从 task.py 源码里读 STEP_BUDGET，不执行它。任务没声明就返回 None。"""
     if not task_py.is_file():

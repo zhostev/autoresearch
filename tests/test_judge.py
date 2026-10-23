@@ -2085,3 +2085,31 @@ class TestSelectionScalesTheError(unittest.TestCase):
         )
         self.assertNotEqual(detail, "未标定")
         self.assertEqual(decision, "成立")
+
+
+class TestOverrunProjection(unittest.TestCase):
+    """缺陷 9：步数预算与墙钟上限互不知情，注定跑不完的配置要烧满墙钟才被发现。"""
+
+    def test_a_run_on_pace_is_not_cut(self):
+        # 10200 步、540 秒上限；当前速率投影 464 秒，跑得完。
+        self.assertFalse(judge.will_overrun(1000, 45.5, 10200, 540.0))
+
+    def test_a_run_off_pace_is_cut_early(self):
+        # 第四夜轮 2 的真实速率：9990 步用了 542 秒，投影 553 秒 > 540。
+        self.assertTrue(judge.will_overrun(1000, 54.3, 10200, 540.0))
+
+    def test_nothing_is_judged_before_the_probe(self):
+        # 探测期内不下结论，哪怕速率看着很糟——前几百步还没稳定。
+        self.assertFalse(judge.will_overrun(999, 500.0, 10200, 540.0))
+        self.assertFalse(judge.will_overrun(0, 0.0, 10200, 540.0))
+
+    def test_the_probe_length_is_adjustable(self):
+        self.assertFalse(judge.will_overrun(200, 11.0, 10200, 540.0, probe_steps=500))
+        self.assertTrue(judge.will_overrun(500, 27.2, 10200, 540.0, probe_steps=500))
+
+    def test_the_saving_is_an_order_of_magnitude(self):
+        # 按第四夜轮 2 的速率，投影在 1000 步（约 54 秒）就能下结论，
+        # 而不是跑满 540 秒才发现。
+        rate = 542.5 / 9990
+        self.assertTrue(judge.will_overrun(1000, rate * 1000, 10200, 540.0))
+        self.assertLess(rate * 1000, 540.0 / 9)

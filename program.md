@@ -11,7 +11,13 @@ To set up a new experiment, work with the user to:
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `task.py` — the frozen ruler: data root, time budget, the validation set, and the metric. Do not modify.
+   - `task.py` — the frozen ruler: data root, budget, the validation set, and the
+     metric. Do not modify. Its `should_stop` is the one place training may end;
+     when the budget counts steps, it should also call `judge.will_overrun`, which
+     projects from the pace once it has settled and ends a run that cannot finish
+     in time. Without that projection a configuration past the compute ceiling
+     burns the whole wall clock before anyone learns it never had a chance, and
+     every mechanism near the ceiling pays that fee once.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 5. **Do not create the tables by hand**: Leave `results.tsv`, `parents.tsv`, `queue.tsv`, and `run.json` uncreated. `uv run judge.py calibrate` writes the baseline rows, the parent list, and the calibration.
@@ -31,10 +37,10 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **What you CANNOT do:**
 - Modify `prepare.py`, `judge.py`, or `task.py`.
-- Edit `results.tsv`, `parents.tsv`, `queue.tsv`, or `run.json` by hand.
+- Edit `results.tsv`, `parents.tsv`, `queue.tsv`, `run.json`, or `ledger.jsonl` by hand. `ledger.jsonl` is append-only: `judge.py trial` writes an `admit` event before training starts and a `result` event after it ends. A run identity (commit + eval_hash + seed + knobs + step budget) that already completed is refused before any compute is spent.
 - Install new packages or add dependencies.
 - Modify the evaluation harness. `task.score` is the ground truth metric, and `task.load_val` is the only source of a validation set. Take the training loader from `task.load_train` too; never build your own loader over the data directory.
-- Change the ruler mid-run. `judge.py` hashes `task.py`, `prepare.py`, and the data directory into one `eval_hash`. If it stops matching `run.json`, every command except `report` refuses until the human recalibrates, and the night's results split into two incomparable halves.
+- Change the ruler mid-run. `judge.py` hashes `task.py`, `prepare.py`, and the data directory into one `eval_hash`. If it stops matching `run.json`, every command except `report`, `compare` and `audit` refuses until the human recalibrates, and the night's results split into two incomparable halves.
 - Hardcode a random seed. `train.py` must keep the `seed_everything()` call.
 - Treat a parent-list update as a validated claim. Do not call a parent-list update a validated claim.
 
@@ -77,6 +83,9 @@ uv run judge.py trial --seed 1 --mechanism 学习率 --knobs LEARNING_RATE \
     --expect lower --fail 变高或崩溃
 ```
 
+   The ledger records the admission before the training command starts. If
+   the same identity already completed, the command is refused before any
+   compute; a failed measurement may be retried.
 6. Read the new `results.tsv` row. `judge.py` does not create commits and does
    not reset them. A trial that scores *worse* than its parent is measured once
    and judged. A trial that scores better triggers 追加测量: judge runs the same
@@ -103,6 +112,11 @@ uv run judge.py trial --seed 1 --mechanism 学习率 --knobs LEARNING_RATE \
 
 Overnight search uses seed 1 only. The parent list holds at most three commits.
 
+Before calling anything validated, run `uv run judge.py audit`. It is
+read-only and reports inconsistencies between the ledger, `results.tsv`,
+`parents.tsv` and `queue.tsv` (duplicates, missing eval hashes, unreviewed
+parents, multi-knob accepts, orphan queue entries).
+
 `judge.py` rewrites `REPORT.md` after every `calibrate`, `accept`, and `claim`.
 Read it instead of keeping your own tally; `uv run judge.py report` recomputes
 it on demand.
@@ -114,6 +128,19 @@ Pick one or two commits you might call validated. For the parent and then the ca
 ```text
 uv run judge.py trial --seed 2 --mechanism <same short name> --expect lower --fail <same failure sentence>
 ```
+
+Then compare the two arms on their shared seeds:
+
+```text
+uv run judge.py compare --base <parent> --treat <candidate> --json
+```
+
+`compare` is the paired readout: it requires at least two shared seeds and
+the same `eval_hash` on both arms. `significant` with `direction=better` is
+the only verdict that reads as an improvement; `inconclusive` means the
+materials are insufficient, the effect is inside the noise band, or it is
+below `min_improvement`. `claim` applies its own selection penalty on top,
+so a passed `compare` is necessary but not sufficient.
 
 Then, on the candidate commit, run:
 
