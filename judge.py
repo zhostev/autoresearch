@@ -14,9 +14,16 @@ import signal
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 TIMEOUT_SECONDS = 600
+
+LEDGER_FILE = "ledger.jsonl"
+"""append-only 的 run 账本。results.tsv 是给人读的投影，这里是机器核的身份。"""
+
+ALPHA = 0.05
+"""配对检验的显著性水平。与 expctl 的 G4 同口径：预注册，跑完不许改。"""
 
 RUN_FILE = "run.json"
 RUN_FIELDS: tuple[tuple[str, type], ...] = (
@@ -106,6 +113,78 @@ def claim_threshold(
     """
     crowd = math.sqrt(2.0 * math.log(max(n_mech, 2)))
     return (z + crowd) * standard_error(sigma_candidate, sigma_parent, m, n)
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    """不完全 beta 函数的连分式（Numerical Recipes 6.4）。
+
+    stdlib 没有 t 分布；配对样本只有 2–5 对时用正态近似会让 p 值偏小，
+    所以这里补一个不引第三方依赖的精确 t 尾概率。
+    """
+    max_iter, eps, tiny = 200, 3e-14, 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _betai(a: float, b: float, x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_beta = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + a * math.log(x) + b * math.log(1.0 - x)
+    )
+    beta = math.exp(log_beta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return beta * _betacf(a, b, x) / a
+    return 1.0 - beta * _betacf(b, a, 1.0 - x) / b
+
+
+def paired_p_value(deltas: list[float]) -> float | None:
+    """双侧配对 t 检验的 p 值。
+
+    样本不足或差值完全同值（方差 0）时返回 None：两次测量给出完全相同的
+    差值，更可能是测量被钉死，而不是「无穷显著」。expctl 对这条判 inconclusive。
+    """
+    if len(deltas) < 2:
+        return None
+    spread = statistics.stdev(deltas)
+    if spread == 0.0:
+        return None
+    t_stat = statistics.fmean(deltas) / (spread / math.sqrt(len(deltas)))
+    df = len(deltas) - 1
+    return _betai(df / 2.0, 0.5, df / (df + t_stat * t_stat))
+
 
 COUNTED_DECISIONS = frozenset({
     "好于父本",
@@ -624,6 +703,87 @@ COMPLETED_DECISIONS = frozenset({
 })
 
 
+def _now() -> str:
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def canonical_json(payload: dict) -> str:
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def run_identity(
+    commit: str,
+    parent: str,
+    eval_hash: str,
+    seed: str,
+    knobs: str,
+    step_budget: int | None,
+) -> str:
+    """内容寻址的 run 身份：同一份代码、尺子、种子与预算只有一个名字。
+
+    与 expctl 的 run_id 同构，但**不**把 mechanism/expect/fail 放进来：
+    那是这条 run 的假设叙述，不是身份；改叙述不该换一条 run。
+    预算进身份：同一提交在 300 秒与 10200 步下不是同一条测量。
+    """
+    payload = {
+        "commit": commit,
+        "parent": parent,
+        "eval_hash": eval_hash,
+        "seed": seed,
+        "knobs": knobs,
+        "step_budget": "" if step_budget is None else step_budget,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def read_ledger(repo: Path) -> tuple[list[dict], int]:
+    """读 append-only 账本，返回 (事件, 坏行数)。坏行不吞掉，交给 audit 报。"""
+    path = repo / LEDGER_FILE
+    if not path.is_file():
+        return [], 0
+    events: list[dict] = []
+    bad = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line == "":
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if not isinstance(event, dict):
+            bad += 1
+            continue
+        events.append(event)
+    return events, bad
+
+
+def append_ledger(repo: Path, event: dict) -> None:
+    path = repo / LEDGER_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(canonical_json(event) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def ledger_status(events: list[dict]) -> dict[str, dict]:
+    """run_id -> {admitted, completed}。只认 run_id 字段，不猜。"""
+    status: dict[str, dict] = {}
+    for event in events:
+        run_id = event.get("run_id")
+        if not isinstance(run_id, str) or run_id == "":
+            continue
+        slot = status.setdefault(run_id, {"admitted": False, "completed": False})
+        if event.get("event") == "admit":
+            slot["admitted"] = True
+        elif event.get("event") == "result" and event.get("decision") in COMPLETED_DECISIONS:
+            slot["completed"] = True
+    return status
+
+
 def ruler_moved(repo: Path, config: dict | None, test_root: bool) -> bool:
     if config is None:
         return True
@@ -730,6 +890,13 @@ def main(
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("claim", "report"):
         sub.add_parser(name)
+    audit_parser = sub.add_parser("audit")
+    audit_parser.add_argument("--json", action="store_true")
+    compare_parser = sub.add_parser("compare")
+    compare_parser.add_argument("--base", required=True)
+    compare_parser.add_argument("--treat", required=True)
+    compare_parser.add_argument("--mde", type=float, default=None)
+    compare_parser.add_argument("--json", action="store_true")
     calibrate_parser = sub.add_parser("calibrate")
     calibrate_parser.add_argument("--force", action="store_true")
     accept_parser = sub.add_parser("accept")
@@ -746,6 +913,10 @@ def main(
     if args.cmd == "report":
         write_report(repo)
         return 0
+    if args.cmd == "compare":
+        return cmd_compare(repo, args.base, args.treat, args.mde, args.json)
+    if args.cmd == "audit":
+        return cmd_audit(repo, args.json)
     if args.cmd == "calibrate":
         return cmd_calibrate(
             repo,
@@ -852,27 +1023,73 @@ def main(
         append_result(results_path, row)
         return 0
     row["eval_hash"] = identity
+    budget = step_budget(task_py)
+    run_id = run_identity(
+        head, row["parent"], identity, args.seed, row["knobs"], budget
+    )
+    ledger_events, _ = read_ledger(repo)
+    if ledger_status(ledger_events).get(run_id, {}).get("completed"):
+        return refuse(f"这个 run 身份已经完成过：{run_id[:12]}")
+    append_ledger(repo, {
+        "event": "admit",
+        "run_id": run_id,
+        "at": _now(),
+        "commit": head,
+        "parent": row["parent"],
+        "seed": args.seed,
+        "eval_hash": identity,
+        "knobs": row["knobs"],
+        "step_budget": budget,
+        "mechanism": args.mechanism,
+        "expect": args.expect,
+        "fail": args.fail,
+    })
+
+    def record(
+        result_row: dict,
+        steps: int | None = None,
+        seconds: float | None = None,
+        run_key: str | None = None,
+    ) -> None:
+        """结果表是投影，账本是身份；两边同一次写入，不各写各的。"""
+        append_result(results_path, result_row)
+        append_ledger(repo, {
+            "event": "result",
+            "run_id": run_key or run_id,
+            "at": _now(),
+            "commit": result_row["commit"],
+            "seed": result_row["seed"],
+            "decision": result_row["decision"],
+            "val_bpb": result_row["val_bpb"],
+            "steps": steps,
+            "seconds": None if seconds is None else round(seconds, 3),
+            "detail": result_row["detail"],
+        })
+
+    started = time.monotonic()
     code = run_command(train, args.seed, repo / "run.log", timeout)
+    elapsed = time.monotonic() - started
     log_text = (repo / "run.log").read_text(encoding="utf-8") if (repo / "run.log").exists() else ""
+    steps = parse_steps(log_text)
     printed_seed, printed_bpb = parse_summary(log_text)
     if code != 0 or printed_bpb is None:
         row["decision"] = "代码坏了"
-        append_result(results_path, row)
+        record(row, steps=steps, seconds=elapsed)
         return 0
     if printed_seed != args.seed:
         row["decision"] = "测量失败"
-        append_result(results_path, row)
+        record(row, steps=steps, seconds=elapsed)
         return 0
     cut = short_run(log_text, task_py)
     if cut is not None:
         row["decision"] = "测量失败"
         row["detail"] = f"只跑了 {cut[0]} 步，预算 {cut[1]} 步"
-        append_result(results_path, row)
+        record(row, steps=cut[0], seconds=elapsed)
         return 0
     row["val_bpb"] = printed_bpb
     if args.seed == "2":
         row["decision"] = "已记录"
-        append_result(results_path, row)
+        record(row, steps=steps, seconds=elapsed)
         return 0
     parent_commit = row["parent"]
     parent_rows = [
@@ -906,27 +1123,48 @@ def main(
                 "expect": args.expect, "fail": args.fail,
                 "seed": seed, "eval_hash": identity,
             })
+            extra_id = run_identity(
+                head, parent_commit, identity, seed, "", budget
+            )
+            append_ledger(repo, {
+                "event": "admit",
+                "run_id": extra_id,
+                "at": _now(),
+                "commit": head,
+                "parent": parent_commit,
+                "seed": seed,
+                "eval_hash": identity,
+                "knobs": "",
+                "step_budget": budget,
+                "mechanism": args.mechanism,
+                "expect": args.expect,
+                "fail": args.fail,
+                "detail": "追加测量",
+            })
+            started = time.monotonic()
             code = run_command(train, seed, repo / "run.log", timeout)
+            extra_elapsed = time.monotonic() - started
             log_path = repo / "run.log"
             text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+            extra_steps = parse_steps(text)
             got_seed, got_bpb = parse_summary(text)
             if code != 0 or got_bpb is None:
                 extra["decision"] = "代码坏了"
-                append_result(results_path, extra)
+                record(extra, steps=extra_steps, seconds=extra_elapsed, run_key=extra_id)
                 break
             if got_seed != seed:
                 extra["decision"] = "测量失败"
-                append_result(results_path, extra)
+                record(extra, steps=extra_steps, seconds=extra_elapsed, run_key=extra_id)
                 break
             cut = short_run(text, task_py)
             if cut is not None:
                 extra["decision"] = "测量失败"
                 extra["detail"] = f"只跑了 {cut[0]} 步，预算 {cut[1]} 步"
-                append_result(results_path, extra)
+                record(extra, steps=cut[0], seconds=extra_elapsed, run_key=extra_id)
                 break
             extra["val_bpb"] = got_bpb
             extra["decision"] = "已记录"
-            append_result(results_path, extra)
+            record(extra, steps=extra_steps, seconds=extra_elapsed, run_key=extra_id)
             samples.append(float(got_bpb))
     mean = statistics.fmean(samples)
     parent_samples = list(sample_scores(rows, parent_commit).values())
@@ -940,7 +1178,7 @@ def main(
     row["decision"] = compare_to_parent(mean, parent_bpb, band)
     if len(samples) > 1:
         row["detail"] = f"{len(samples)} 次均值 {mean:.6f}"
-    append_result(results_path, row)
+    record(row, steps=steps, seconds=elapsed)
     return 0
 
 
@@ -1181,6 +1419,290 @@ def cmd_claim(repo: Path, test_root: bool) -> int:
         write_queue(repo / "queue.tsv", dequeue(read_queue(repo / "queue.tsv"), head))
     write_report(repo)
     return 0
+
+
+def resolve_commit(repo: Path, ref: str, rows: list[dict]) -> str | None:
+    """先把 ref 当 git 引用解析；解析不了再按结果表里的前缀唯一匹配。"""
+    resolved = git_output(repo, "rev-parse", "--verify", ref + "^{commit}")
+    if resolved:
+        return resolved
+    matches = sorted({row["commit"] for row in rows if row["commit"].startswith(ref)})
+    return matches[0] if len(matches) == 1 else None
+
+
+def paired_compare(rows: list[dict], base: str, treat: str, mde: float) -> dict:
+    """两臂在共享种子上的配对检验。
+
+    与 accept 用的独立噪声带不是一回事：配对能消掉「这一对共享的难度」，
+    在种子数相同的情况下更灵敏；代价是要求两臂测过同一批种子。
+    判据三条，缺一不可：同一把尺子、至少 2 对、p < ALPHA 且 |Δ| ≥ MDE。
+    """
+    base_samples = sample_scores(rows, base)
+    treat_samples = sample_scores(rows, treat)
+    shared = sorted(set(base_samples) & set(treat_samples), key=int)
+    base_hashes = {
+        row["eval_hash"] for row in rows
+        if row["commit"] == base and row["seed"] in base_samples and row["eval_hash"]
+    }
+    treat_hashes = {
+        row["eval_hash"] for row in rows
+        if row["commit"] == treat and row["seed"] in treat_samples and row["eval_hash"]
+    }
+    result = {
+        "base": base,
+        "treat": treat,
+        "base_samples": len(base_samples),
+        "treat_samples": len(treat_samples),
+        "pairs": len(shared),
+        "seeds": shared,
+        "mde": mde,
+        "alpha": ALPHA,
+        "mean_delta": None,
+        "p_value": None,
+        "pair_deltas": {},
+        "verdict": "inconclusive",
+        "reason": "",
+    }
+    if not base_hashes or not treat_hashes:
+        result["verdict"] = "not_comparable"
+        result["reason"] = "有一臂没有带尺子身份（eval_hash）的完成记录"
+        return result
+    if base_hashes != treat_hashes:
+        result["verdict"] = "not_comparable"
+        result["reason"] = "两臂的 eval_hash 不同：在不同考卷上测的，不能配对"
+        return result
+    if len(shared) < 2:
+        result["reason"] = f"只有 {len(shared)} 对共享种子；配对检验至少需要 2 对"
+        return result
+    deltas = [treat_samples[seed] - base_samples[seed] for seed in shared]
+    result["pair_deltas"] = {seed: deltas[index] for index, seed in enumerate(shared)}
+    result["mean_delta"] = statistics.fmean(deltas)
+    p_value = paired_p_value(deltas)
+    result["p_value"] = p_value
+    if p_value is None:
+        result["reason"] = "配对差值方差为 0，t 检验无定义"
+        return result
+    if p_value >= ALPHA:
+        result["reason"] = f"p={p_value:.5f} ≥ {ALPHA}"
+        return result
+    if abs(result["mean_delta"]) < mde:
+        result["reason"] = (
+            f"统计显著但 |Δ|={abs(result['mean_delta']):.6f} < MDE={mde:.6f}："
+            "大到能被看见，还没大到人关心"
+        )
+        return result
+    result["verdict"] = "significant"
+    result["direction"] = "better" if result["mean_delta"] < 0 else "worse"
+    result["reason"] = f"p={p_value:.5f} < {ALPHA} 且 |Δ| ≥ MDE"
+    return result
+
+
+def compute_ratio(repo: Path, base: str, treat: str) -> float | None:
+    """两臂实测步数的比值；只在两边都有数字时给，缺一边就返回 None。
+
+    这是 expctl V5-84 的算力轴：Δ 里可能混着「多跑了步数」的贡献。
+    本例是软警告，不设阈值门——「差几倍算超」推不出公理，硬拦会改判历史。
+    """
+    events, _ = read_ledger(repo)
+    steps: dict[str, list[int]] = {base: [], treat: []}
+    for event in events:
+        if event.get("event") != "result":
+            continue
+        if event.get("decision") not in COMPLETED_DECISIONS:
+            continue
+        commit = event.get("commit")
+        value = event.get("steps")
+        if commit in steps and isinstance(value, int) and value > 0:
+            steps[commit].append(value)
+    if not steps[base] or not steps[treat]:
+        return None
+    low = min(statistics.median(steps[base]), statistics.median(steps[treat]))
+    high = max(statistics.median(steps[base]), statistics.median(steps[treat]))
+    if low <= 0:
+        return None
+    return high / low
+
+
+def cmd_compare(
+    repo: Path, base_ref: str, treat_ref: str, mde_override: float | None,
+    as_json: bool,
+) -> int:
+    rows = read_results(repo / "results.tsv")
+    base = resolve_commit(repo, base_ref, rows)
+    treat = resolve_commit(repo, treat_ref, rows)
+    if base is None or treat is None:
+        return refuse(f"解析不了提交：{base_ref if base is None else treat_ref}")
+    config = read_run(repo)
+    if mde_override is not None:
+        mde = mde_override
+    elif config is not None:
+        mde = float(config.get("min_improvement", 0.0))
+    else:
+        mde = 0.0
+    result = paired_compare(rows, base, treat, mde)
+    result["compute_ratio"] = compute_ratio(repo, base, treat)
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(f"=== compare: {base[:12]} vs {treat[:12]} ===")
+    print(f"Metric: val_bpb (lower is better)   MDE: {mde:.6f}")
+    print(f"Pairs: {result['pairs']}   shared seeds: {','.join(result['seeds']) or '（无）'}")
+    if result["mean_delta"] is not None:
+        print(f"Mean Delta: {result['mean_delta']:+.6f}")
+    if result["p_value"] is not None:
+        print(f"p-value: {result['p_value']:.5f}   alpha: {ALPHA}")
+    if result["compute_ratio"] is not None:
+        line = f"Compute ratio (steps): {result['compute_ratio']:.2f}x"
+        if result["compute_ratio"] >= 2.0:
+            line += "  警告：两臂算力相差 ≥2x，Δ 里混着预算差"
+        print(line)
+    print(f"Verdict: {result['verdict'].upper()}")
+    if result["reason"]:
+        print(f"Reason: {result['reason']}")
+    return 0
+
+
+def build_audit(repo: Path) -> dict:
+    rows = read_results(repo / "results.tsv")
+    events, bad_lines = read_ledger(repo)
+    parents = read_parents(repo / "parents.tsv")
+    queue = read_queue(repo / "queue.tsv")
+    config = read_run(repo)
+    status = ledger_status(events)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if bad_lines:
+        errors.append(f"ledger.jsonl 有 {bad_lines} 行不是合法 JSON 对象")
+
+    search_rows = [row for row in rows if row["seed"] not in ("", "*")]
+    completed = [
+        row for row in search_rows if row["decision"] in COMPLETED_DECISIONS
+    ]
+
+    for row in completed:
+        if row["eval_hash"] == "":
+            errors.append(
+                f"{row['commit'][:7]} seed {row['seed']} 有完成记录但没有 eval_hash"
+            )
+
+    seen: dict[tuple, int] = {}
+    for row in completed:
+        key = (row["commit"], row["eval_hash"], row["seed"], row["knobs"])
+        seen[key] = seen.get(key, 0) + 1
+    for key, count in seen.items():
+        if count > 1:
+            errors.append(
+                f"同一 run 身份完成了 {count} 次：{key[0][:7]} seed {key[2]}"
+                f"（knobs={key[3] or '无'}）"
+            )
+
+    admitted = {
+        (
+            event.get("commit"), event.get("seed"),
+            event.get("eval_hash"), event.get("knobs", ""),
+        )
+        for event in events
+        if event.get("event") == "admit"
+    }
+    if not events:
+        if completed:
+            warnings.append(
+                f"{len(completed)} 条完成记录早于账本：没有 append-only 的准入证据"
+            )
+    else:
+        legacy = [
+            row for row in completed
+            if row["mechanism"] != "基线"
+            and (row["commit"], row["seed"], row["eval_hash"], row["knobs"]) not in admitted
+        ]
+        if legacy:
+            warnings.append(
+                f"{len(legacy)} 条完成记录没有对应的准入事件（可能是账本启用前的历史）"
+            )
+        open_runs = [
+            run_id for run_id, slot in status.items()
+            if slot["admitted"] and not slot["completed"]
+        ]
+        if open_runs:
+            warnings.append(
+                f"{len(open_runs)} 条准入没有完成记录：崩溃、中断，或正在运行"
+            )
+
+    for parent in parents:
+        if parent.get("reviewed") != "yes":
+            warnings.append(
+                f"父本 {parent['commit'][:7]}（{parent['mechanism']}）尚未复核"
+            )
+        seed1 = next(
+            (
+                row for row in search_rows
+                if row["commit"] == parent["commit"] and row["seed"] == "1"
+            ),
+            None,
+        )
+        if seed1 is not None and "," in seed1["knobs"]:
+            warnings.append(
+                f"父本 {parent['commit'][:7]} 的机制「{seed1['mechanism']}」"
+                f"一次改了多个旋钮（{seed1['knobs']}）：单变量归因不成立"
+            )
+
+    parent_commits = {parent["commit"] for parent in parents}
+    row_commits = {row["commit"] for row in rows}
+    claimed = {row["commit"] for row in rows if row["decision"] in FINAL_CLAIMS}
+    for entry in queue:
+        commit = entry["commit"]
+        if commit not in parent_commits and commit not in row_commits:
+            warnings.append(f"队列里的 {commit[:7]} 在结果和名单里都不存在")
+        elif commit in claimed:
+            warnings.append(f"队列里的 {commit[:7]} 已经 claim 过，应该出队")
+
+    if config is not None:
+        other_rulers = {
+            row["eval_hash"] for row in completed
+            if row["eval_hash"] and row["eval_hash"] != config["eval_hash"]
+        }
+        if other_rulers:
+            warnings.append(
+                f"{len(other_rulers)} 把旧尺子下的完成记录与当前 run.json 不同："
+                "比较时必须按 eval_hash 分组"
+            )
+
+    counts = {
+        "results_rows": len(rows),
+        "search_rows": len(search_rows),
+        "completed_rows": len(completed),
+        "ledger_events": len(events),
+        "admissions": sum(1 for e in events if e.get("event") == "admit"),
+        "ledger_results": sum(1 for e in events if e.get("event") == "result"),
+        "parents": len(parents),
+        "queue": len(queue),
+    }
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "counts": counts,
+    }
+
+
+def cmd_audit(repo: Path, as_json: bool) -> int:
+    report = build_audit(repo)
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("=== audit ===")
+        print(f"ok: {report['ok']}")
+        for name, value in report["counts"].items():
+            print(f"  {name}: {value}")
+        for label, items in (("错误", report["errors"]), ("警告", report["warnings"])):
+            if not items:
+                print(f"{label}: 0")
+                continue
+            print(f"{label}: {len(items)}")
+            for item in items:
+                print(f"- {item}")
+    return 0 if report["ok"] else 1
 
 
 if __name__ == "__main__":
